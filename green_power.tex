@@ -1,0 +1,179 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+\usepackage{amsmath}
+
+
+
+\title{Green Power Model}
+\author{Lei Yang }
+%\date{March 2026}
+
+\begin{document}
+
+\maketitle
+
+
+
+    
+
+
+
+
+In the planning and design stage of the intelligent computing center microgrid, the installed capacities of wind power, photovoltaic systems, and energy storage systems need to be globally optimized and calculated according to the computing load characteristics of different scenarios. The collaborative configuration and optimization of power supply and energy storage system capacities are carried out with objectives such as power supply reliability, renewable energy accommodation capacity, and investment economy.
+
+Taking minimizing investment cost as an example, to make the capacity configuration of each energy device meet the actual operation of the intelligent computing center, a mathematical optimization model for microgrid capacity planning considering operation scheduling needs to be established. Let the planned capacities of the wind turbine system, photovoltaic system, energy storage system, and grid transformer be \(x_{WT}\), \(x_{PV}\), \(x_{ST}\), and \(x_{GD}\) respectively, and the maximum/designed computing load of the intelligent computing center be \(L\).
+
+1. Define the objective function
+\begin{align}
+J = & r\left(\lambda_{WT} x_{WT} + \lambda_{PV} x_{PV} + \lambda_{ST} x_{ST} +\lambda_{GD} x_{GD}\right) \\ \nonumber
+& + M\left(\mu_{DC}x_{GD} +730 \mu_{ELE} x_{GD} \overline{L}\right) + \nu * D \\ \nonumber 
+& -\sum_{t=0}^{T-1}\mu_{MKT,t}p_{GD,t}^{U} 
+\end{align}
+Where:
+
+\noindent - $\lambda_{WT},\lambda_{PV},\lambda_{ST},\lambda_{GD}$: unit price on wind turbine, PV panel, storage battery and transformer; 
+
+\noindent - $\mu_{DC},\mu_{ELE}$: unit price on demand charge and electricity with relevant voltage;
+
+\noindent - $r$: weight on annual operational cost;
+
+\noindent - $M$: total months of a year;
+
+\noindent - $\overline{L}$: provincial average load coefficient;
+
+\noindent - $\nu$: unit price on direct power connection;
+
+\noindent -$D$: distance of direct power connection;
+
+\noindent -$\mu_{MKT,t}$: market electricity price at stage $t$;
+
+\noindent -$p_{GD,t}^{U}$: power sold in the market at stage $t$.
+
+
+2. Define system constraints
+
+(1) capacity balance constraint
+\begin{equation}
+x_{WT} + x_{PV} + x_{ST} + x_{GD} \geq L 
+\end{equation}
+
+(2) power balance constraint
+\begin{equation}
+p_{WT,t} + p_{PV,t} - p_{ST,t}^C + p_{ST,t}^D + p_{GD,t} - p_{GD,t}^{U} = l_t 
+\end{equation}
+Where:
+
+\noindent - $(p_{WT,t}, p_{PV,t}, p_{GD,t}$: power of wind turbine, photovoltaic, and grid transformer at any time $t$ during operation;
+
+\noindent - $p_{ST,t}^C, p_{ST,t}^D$: charging and discharging power of the energy storage system at any time $t$ during operation.
+
+(3) physical constraints of wind turbine system
+\begin{equation}
+0 \leq p_{WT,t} \leq \alpha_{WT,t} \cdot x_{WT} 
+\end{equation}
+
+(4) physical constraints of photovoltaic system
+\begin{equation}
+0 \leq p_{PV,t} \leq \alpha_{PV,t} \cdot x_{PV} 
+\end{equation}
+Where:
+
+\noindent - $\alpha_{WT,t}$: normalized wind power output coefficient at time $t$ (from external meteorological time-series data, $\alpha_{WT,t} \in [0,1]$);
+
+\noindent - $\alpha_{PV,t}$: normalized photovoltaic output coefficient at time $t$ (from external meteorological time-series data, $\alpha_{PV,t} \in [0,1]$).
+
+ (5) physical constraints of energy storage system
+\begin{equation}
+\text{SOC}_{\min} \leq \text{SOC}_t \leq \text{SOC}_{\max} 
+\end{equation}
+
+\begin{equation}
+\text{SOC}_{t+1} \cdot x_{ST} = \text{SOC}_t \cdot x_{ST} + \left(\eta_{ch} \cdot p_{ST,t}^C - \frac{p_{ST,t}^D}{\eta_{dis}}\right) \delta 
+\end{equation}
+Where:
+
+\noindent - \(\text{SOC}_{\min}, \text{SOC}_{\max}\): minimum and maximum allowable state of charge of the energy storage system;
+
+\noindent - \(\eta_{ch}\): charging efficiency of the energy storage system;
+
+\noindent - \(\eta_{dis}\): discharging efficiency of the energy storage system.
+
+\begin{equation}
+0 \leq p_{ST,t}^C \leq P_{ST,\text{MAX}}^C z_1 
+\end{equation}
+
+\begin{equation}
+0 \leq p_{ST,t}^D \leq P_{ST,\text{MAX}}^D z_2 
+\end{equation}
+
+\begin{equation}
+z_1 + z_2 = 1
+\end{equation}
+
+\begin{equation}
+z_1, z_2 \in \{0,1\} 
+\end{equation}
+Where:
+
+\noindent - \(\text{SOC}_t\): state of charge of the energy storage system at time \(t\);
+
+\noindent - \(\delta\): charging/discharging time of the energy storage system;
+
+\noindent - \(P_{ST,\text{MAX}}^C\), \(P_{ST,\text{MAX}}^D\): maximum charging and discharging power of the energy storage system;
+
+\noindent - \(z_1, z_2\): auxiliary variables to ensure the energy storage system cannot charge and discharge simultaneously.
+
+(6) physical constraints of power grid
+\begin{equation}
+0 \leq p_{GD,t} \leq x_{GD} \cdot y_1 
+\end{equation}
+
+\begin{equation}
+0 \leq p_{GD,t}^{U} \leq x_{GD} \cdot y_2 
+\end{equation}
+
+\begin{equation}
+y_1 + y_2 \leq 1
+\end{equation}
+
+\begin{equation}
+y_1, y_2 \in \{0,1\}
+\end{equation}
+
+\begin{equation}
+\frac{\sum_{t=0}^{T-1}p_{GD,t}^{U}\delta}{\sum_{t=0}^{T-1}(p_{WT,t}+p_{PV,t})\delta} \leq \psi 
+\end{equation}
+Where:
+
+\noindent - $y_1, y_2$: auxiliary binary variables to ensure that power purchasing and selling cannot occur simultaneously;
+
+\noindent - $\psi$: proportional coefficient of on-grid electricity to total renewable energy generation (determined by regional policies and regulations);
+
+\noindent - $\delta$: the duration of each stage. 
+
+(7) renewable energy generation constraints
+\begin{equation}
+\frac{\sum_{t=0}^{T-1}(p_{WT,t}+p_{PV,t})\delta-\sum_{t=0}^{T-1}p_{GD,t}^{U}\delta}{\sum_{t=0}^{T-1}(p_{WT,t}+p_{PV,t})\delta} \geq \varphi 
+\end{equation}
+
+\begin{equation}
+\frac{\sum_{t=0}^{T-1}(p_{WT,t}+p_{PV,t})\delta}{\sum_{t=0}^{T-1} l_t \delta} \geq \theta
+\end{equation}
+
+Where:
+\noindent - $\varphi$: proportional coefficient (determined by regional policies);
+\noindent - $\theta$: proportional coefficient (determined by regional policies).
+
+3. Capacity Configuration Model
+Therefore, the capacity configuration model for power supply and energy storage systems of the intelligent computing center microgrid is:
+\begin{equation}
+\begin{aligned}
+&\min ~ J \\
+&\text{s.t.} ~(3-2)-(3-15)
+\end{aligned}
+\end{equation}
+
+This model can be directly solved by mainstream commercial solvers (such as CPLEX) to obtain the optimal capacity configuration of microgrid power supply and energy storage systems and the optimal system investment cost under different scenarios and policy requirements.
+
+
+\end{document}
