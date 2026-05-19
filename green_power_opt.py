@@ -5,6 +5,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Import parameters and synthetic data
 import params as p
@@ -211,6 +212,51 @@ def run_optimization(X_GD_bound, output_dir="."):
     else:
         print(f"Optimization ended with status: {model.Status}")
 
+MAX_SENSITIVITY_WORKERS = 8
+DEFAULT_D = 50.0
+DEFAULT_PHI = 0.6
+DEFAULT_THETA = 0.3
+
+
+def _run_sensitivity_point(D, phi, theta):
+    """Process-pool worker: one sensitivity case with explicit parameters."""
+    return run_single_optimization(D=D, phi=phi, theta=theta)
+
+
+def _parallel_sensitivity_sweep(tasks, sort_key):
+    """
+    Run sensitivity cases in parallel (up to MAX_SENSITIVITY_WORKERS).
+    Each task is a dict with keys D, phi, theta.
+    """
+    if not tasks:
+        return []
+
+    max_workers = min(len(tasks), MAX_SENSITIVITY_WORKERS)
+    print(f"   Running {len(tasks)} cases in parallel (max_workers={max_workers})...")
+    results = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_run_sensitivity_point, t["D"], t["phi"], t["theta"]): t
+            for t in tasks
+        }
+        done = 0
+        for future in as_completed(futures):
+            task = futures[future]
+            done += 1
+            try:
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+                    print(f"   [{done}/{len(tasks)}] done: D={task['D']}, phi={task['phi']}, theta={task['theta']}")
+                else:
+                    print(f"   [{done}/{len(tasks)}] no solution: D={task['D']}, phi={task['phi']}, theta={task['theta']}")
+            except Exception as exc:
+                print(f"   [{done}/{len(tasks)}] failed: D={task['D']}, phi={task['phi']}, theta={task['theta']}: {exc}")
+
+    results.sort(key=lambda r: r[sort_key])
+    return results
+
+
 def run_sensitivity_analysis():
     """Run sensitivity analysis for three key parameters and generate plots."""
     print("\n" + "="*60)
@@ -225,13 +271,11 @@ def run_sensitivity_analysis():
     # ============================================================
     print("\n1. Analyzing impact of D (connection distance)...")
     D_values = np.arange(10, 90, 10)  # 10 to 80 km, step 10
-    D_results = []
-    
-    for D_val in D_values:
-        p.D = D_val
-        result = run_single_optimization()
-        if result is not None:
-            D_results.append(result)
+    D_tasks = [
+        {"D": float(D_val), "phi": DEFAULT_PHI, "theta": DEFAULT_THETA}
+        for D_val in D_values
+    ]
+    D_results = _parallel_sensitivity_sweep(D_tasks, sort_key="D")
     
     if D_results:
         d_vals = [r['D'] for r in D_results]
@@ -262,15 +306,11 @@ def run_sensitivity_analysis():
     # ============================================================
     print("\n2. Analyzing impact of phi (RE self-consumption ratio)...")
     phi_values = np.arange(0.1, 1.0, 0.1)
-    phi_results = []
-    
-    p.D = 50.0  # Reset D to default
-    
-    for phi_val in phi_values:
-        p.phi = round(phi_val, 1)
-        result = run_single_optimization()
-        if result is not None:
-            phi_results.append(result)
+    phi_tasks = [
+        {"D": DEFAULT_D, "phi": round(float(phi_val), 1), "theta": DEFAULT_THETA}
+        for phi_val in phi_values
+    ]
+    phi_results = _parallel_sensitivity_sweep(phi_tasks, sort_key="phi")
     
     if phi_results:
         phi_vals = [r['phi'] for r in phi_results]
@@ -302,15 +342,11 @@ def run_sensitivity_analysis():
     # ============================================================
     print("\n3. Analyzing impact of theta (RE generation ratio)...")
     theta_values = np.arange(0.1, 1.0, 0.1)
-    theta_results = []
-    
-    p.phi = 0.6  # Reset phi to default
-    
-    for theta_val in theta_values:
-        p.theta = round(theta_val, 1)
-        result = run_single_optimization()
-        if result is not None:
-            theta_results.append(result)
+    theta_tasks = [
+        {"D": DEFAULT_D, "phi": DEFAULT_PHI, "theta": round(float(theta_val), 1)}
+        for theta_val in theta_values
+    ]
+    theta_results = _parallel_sensitivity_sweep(theta_tasks, sort_key="theta")
     
     if theta_results:
         theta_vals = [r['theta'] for r in theta_results]
@@ -337,20 +373,21 @@ def run_sensitivity_analysis():
         df_theta_export.to_excel('plot/sensitivity_theta.xlsx', index=False, sheet_name='Theta Analysis')
         print(f"   ✓ Excel saved: plot/sensitivity_theta.xlsx")
     
-    # Reset parameters to defaults
-    p.D = 50.0
-    p.phi = 0.6
-    p.theta = 0.3
-    
     print("\n" + "="*60)
     print(" All sensitivity analysis plots and data exported!")
     print("="*60)
 
-def run_single_optimization():
+def run_single_optimization(D=None, phi=None, theta=None):
     """
     Run single optimization and return key results.
     Used for sensitivity analysis.
+
+    D, phi, theta: optional overrides (defaults from params module).
     """
+    D_val = p.D if D is None else D
+    phi_val = p.phi if phi is None else phi
+    theta_val = p.theta if theta is None else theta
+
     try:
         # Create model
         model = gp.Model("GreenPowerMicrogrid")
@@ -383,7 +420,7 @@ def run_single_optimization():
         # Objective
         cost_investment = p.CRF * (p.lambda_WT * x_WT + p.lambda_PV * x_PV + p.lambda_ST * x_ST + p.lambda_GD * x_GD)
         cost_grid_fixed = p.M * (p.mu_DC * x_GD + 730 * p.mu_ELE * x_GD * p.L_bar)
-        cost_connection = p.nu * p.D
+        cost_connection = p.nu * D_val
         revenue_market = gp.quicksum(p.mu_MKT_t[t] * p_GD_U[t] for t in range(p.T))
         
         J = cost_investment + cost_grid_fixed + cost_connection - revenue_market
@@ -418,8 +455,8 @@ def run_single_optimization():
         sum_re = gp.quicksum((p_WT[t] + p_PV[t]) * p.delta for t in range(p.T))
         
         model.addConstr(sum_gd_u <= p.psi * sum_re, name="c_grid_prop")
-        model.addConstr(sum_re - sum_gd_u >= p.phi * sum_re, name="c_re_prop1")
-        model.addConstr(sum_re >= p.theta * p.L, name="c_re_prop2")
+        model.addConstr(sum_re - sum_gd_u >= phi_val * sum_re, name="c_re_prop1")
+        model.addConstr(sum_re >= theta_val * p.L, name="c_re_prop2")
         
         # Optimize
         model.optimize()
@@ -428,7 +465,7 @@ def run_single_optimization():
             # Real (un-annualized) cost breakdown
             N = p.project_life  # project lifetime in years
             c_inv = p.lambda_WT * x_WT.X + p.lambda_PV * x_PV.X + p.lambda_ST * x_ST.X + p.lambda_GD * x_GD.X
-            c_conn = p.nu * p.D
+            c_conn = p.nu * D_val
             c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ELE * x_GD.X * p.L_bar)
             rev_mkt = sum(p.mu_MKT_t[t] * p_GD_U[t].X for t in range(p.T))
             total_load = sum(p.load_t[t] for t in range(p.T))
@@ -436,9 +473,9 @@ def run_single_optimization():
             c_ele = ((c_inv + c_conn) + N * (c_grid - rev_mkt)) / (N * total_load) * 10 if total_load > 0 else 0
             
             return {
-                'D': p.D,
-                'phi': p.phi,
-                'theta': p.theta,
+                'D': D_val,
+                'phi': phi_val,
+                'theta': theta_val,
                 'c_ele': c_ele,
                 'c_inv': c_inv,           # 设备投资总额(一次性,万元)
                 'c_grid': c_grid,         # 年电网费(万元/年)
@@ -461,27 +498,27 @@ def _run_optimization_job(X_GD_bound):
 
 
 if __name__ == "__main__":
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    # from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    X_GD_bounds = list(range(35, 40, 5))
-    # Parallel: each job uses its own Gurobi model and output directory.
-    # Set PARALLEL=False to run sequentially (writes to results/x_gd_<bound>/ either way).
-    PARALLEL = True
+    # X_GD_bounds = list(range(35, 40, 5))
+    # # Parallel: each job uses its own Gurobi model and output directory.
+    # # Set PARALLEL=False to run sequentially (writes to results/x_gd_<bound>/ either way).
+    # PARALLEL = True
 
-    if PARALLEL and len(X_GD_bounds) > 1:
-        max_workers = min(len(X_GD_bounds), os.cpu_count() or 1)
-        print(f"Running {len(X_GD_bounds)} optimizations in parallel (max_workers={max_workers})...")
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_run_optimization_job, b): b for b in X_GD_bounds}
-            for future in as_completed(futures):
-                bound = futures[future]
-                try:
-                    future.result()
-                    print(f"[done] X_GD_bound={bound}")
-                except Exception as exc:
-                    print(f"[failed] X_GD_bound={bound}: {exc}")
-    else:
-        for X_GD_bound in X_GD_bounds:
-            _run_optimization_job(X_GD_bound)
+    # if PARALLEL and len(X_GD_bounds) > 1:
+    #     max_workers = min(len(X_GD_bounds), os.cpu_count() or 1)
+    #     print(f"Running {len(X_GD_bounds)} optimizations in parallel (max_workers={max_workers})...")
+    #     with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    #         futures = {executor.submit(_run_optimization_job, b): b for b in X_GD_bounds}
+    #         for future in as_completed(futures):
+    #             bound = futures[future]
+    #             try:
+    #                 future.result()
+    #                 print(f"[done] X_GD_bound={bound}")
+    #             except Exception as exc:
+    #                 print(f"[failed] X_GD_bound={bound}: {exc}")
+    # else:
+    #     for X_GD_bound in X_GD_bounds:
+    #         _run_optimization_job(X_GD_bound)
     # run_optimization(0)
-    # run_sensitivity_analysis()
+    run_sensitivity_analysis()
