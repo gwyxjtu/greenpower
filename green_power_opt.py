@@ -9,9 +9,15 @@ import pandas as pd
 # Import parameters and synthetic data
 import params as p
 
-def run_optimization():
+def run_optimization(X_GD_bound, output_dir="."):
+    os.makedirs(output_dir, exist_ok=True)
+    results_path = os.path.join(output_dir, "optimization_results.txt")
+    csv_path = os.path.join(output_dir, "timeseries_results.csv")
+    ilp_path = os.path.join(output_dir, "model.ilp")
+
     print("="*60)
-    print(" Green Power Microgrid Capacity Planning Model")
+    print(f" Green Power Microgrid Capacity Planning Model (x_GD >= {X_GD_bound} MW)")
+    print(f" Output directory: {output_dir}")
     print("="*60)
     print("Building model...")
     
@@ -26,9 +32,10 @@ def run_optimization():
     model = gp.Model("GreenPowerMicrogrid")
     
     # Optional: set parameters for the solver
-    model.setParam('MIPGap', 0.01)    # 1% gap
+    model.setParam('MIPGap', 0.05)    # 1% gap
     model.setParam('TimeLimit', 300)  # 5 min time limit
-    
+    model.setParam('Heuristics', 0.5)    # More heuristics
+
     # ============================================================
     # 1. Variables Definition
     # ============================================================
@@ -38,7 +45,7 @@ def run_optimization():
     x_WT = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_WT")
     x_PV = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_PV")
     x_ST = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_ST")
-    x_GD = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_GD")
+    x_GD = model.addVar(lb=X_GD_bound, vtype=GRB.CONTINUOUS, name="x_GD")
     
     # Operation variables for each time step t (0 to T-1)
     p_WT = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_WT")
@@ -135,7 +142,7 @@ def run_optimization():
     # 5. Result Output
     # ============================================================
     if model.SolCount > 0:
-        with open("optimization_results.txt", "w", encoding="utf-8") as f:
+        with open(results_path, "w", encoding="utf-8") as f:
             f.write("="*60 + "\n")
             status_str = "OPTIMAL" if model.Status == GRB.OPTIMAL else f"UNFINISHED (Status {model.Status}, Feasible solution found)"
             f.write(f" Optimization Terminated! Status: {status_str}\n")
@@ -172,11 +179,11 @@ def run_optimization():
             f.write(f" - Total Renewable Generation: {total_re:.2f} MWh\n")
             f.write(f" - Total Load Demand: {total_load:.2f} MWh\n")
         
-        print(f"Optimization successful! Results have been saved to 'optimization_results.txt'.")
+        print(f"Optimization successful! Results saved to '{results_path}'.")
         
         # Save time-series results to CSV
         import csv
-        with open("timeseries_results.csv", "w", newline='', encoding="utf-8") as csvfile:
+        with open(csv_path, "w", newline='', encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(["Hour", "Load", "P_WT", "P_PV", "P_ST_Charge", "P_ST_Discharge", "SOC", "P_Grid_Buy", "P_Grid_Sell"])
             for t in range(p.T):
@@ -193,14 +200,14 @@ def run_optimization():
                     round(p_GD[t].X, 2),
                     round(p_GD_U[t].X, 2)
                 ])
-        print("Time-series data has been saved to 'timeseries_results.csv'.")
+        print(f"Time-series data saved to '{csv_path}'.")
         
     elif model.Status == GRB.INFEASIBLE:
         print("Model is Infeasible! Please check the parameters or constraints.")
         # Compute IIS to find the conflicting constraints
         model.computeIIS()
-        model.write("model.ilp")
-        print("IIS written to file 'model.ilp'")
+        model.write(ilp_path)
+        print(f"IIS written to '{ilp_path}'")
     else:
         print(f"Optimization ended with status: {model.Status}")
 
@@ -447,6 +454,34 @@ def run_single_optimization():
         print(f"   Error in optimization: {e}")
         return None
 
+def _run_optimization_job(X_GD_bound):
+    output_dir = os.path.join("results", f"x_gd_{X_GD_bound}")
+    run_optimization(X_GD_bound, output_dir=output_dir)
+    return X_GD_bound
+
+
 if __name__ == "__main__":
-    run_optimization()
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    X_GD_bounds = list(range(35, 40, 5))
+    # Parallel: each job uses its own Gurobi model and output directory.
+    # Set PARALLEL=False to run sequentially (writes to results/x_gd_<bound>/ either way).
+    PARALLEL = True
+
+    if PARALLEL and len(X_GD_bounds) > 1:
+        max_workers = min(len(X_GD_bounds), os.cpu_count() or 1)
+        print(f"Running {len(X_GD_bounds)} optimizations in parallel (max_workers={max_workers})...")
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_run_optimization_job, b): b for b in X_GD_bounds}
+            for future in as_completed(futures):
+                bound = futures[future]
+                try:
+                    future.result()
+                    print(f"[done] X_GD_bound={bound}")
+                except Exception as exc:
+                    print(f"[failed] X_GD_bound={bound}: {exc}")
+    else:
+        for X_GD_bound in X_GD_bounds:
+            _run_optimization_job(X_GD_bound)
+    # run_optimization(0)
     # run_sensitivity_analysis()

@@ -8,6 +8,8 @@ are generated as synthetic placeholders. Replace with real data.
 
 import numpy as np
 
+
+
 # ============================================================
 # 1. Time Parameters
 # ============================================================
@@ -19,7 +21,7 @@ delta = 1.0       # Duration of each time step (hours)
 # ============================================================
 lambda_WT = 600.0     # Wind turbine unit price (万元/MW)
 lambda_PV = 300.0     # PV panel unit price (万元/MW)
-lambda_ST = 50.0     # Energy storage unit price (万元/MWh)
+lambda_ST = 150.0     # Energy storage unit price (万元/MWh)
 lambda_GD = 12.0      # Grid transformer unit price (万元/MW)
 
 # ============================================================
@@ -99,7 +101,7 @@ def generate_synthetic_data(T):
 
     # --- Wind power output coefficient (0~1) ---
     # Wind tends to be stronger at night and in winter
-    wind_base = 0.25
+    wind_base = 0.2
     wind_diurnal = 0.1 * np.cos(2 * np.pi * hour_of_day / 24)
     wind_seasonal = 0.1 * np.cos(2 * np.pi * day_of_year / 365)
     wind_noise = 0.1 * np.random.RandomState(42).randn(T)
@@ -118,12 +120,12 @@ def generate_synthetic_data(T):
 
     # --- Market electricity price (万元/MWh) ---
     # Time-of-use pricing: peak / flat / valley
-    mu_MKT_t = np.full(T, 0.05)  # flat
+    mu_MKT_t = np.full(T, 0.035)  # flat
     peak_hours = (hour_of_day >= 8) & (hour_of_day < 12) | \
                  (hour_of_day >= 17) & (hour_of_day < 21)
     valley_hours = (hour_of_day >= 23) | (hour_of_day < 7)
-    mu_MKT_t[peak_hours] = 0.08
-    mu_MKT_t[valley_hours] = 0.03
+    mu_MKT_t[peak_hours] = 0.045
+    mu_MKT_t[valley_hours] = 0.025
 
     return load_t, alpha_WT_t, alpha_PV_t, mu_MKT_t
 
