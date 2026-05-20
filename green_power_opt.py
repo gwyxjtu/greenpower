@@ -393,7 +393,7 @@ def run_single_optimization(D=None, phi=None, theta=None):
         model = gp.Model("GreenPowerMicrogrid")
         model.setParam('OutputFlag', 0)      # Suppress output
         model.setParam('MIPGap', 0.05)       # 5% gap for faster solving
-        model.setParam('TimeLimit', 300)     # 5 min limit for sensitivity analysis
+        # model.setParam('TimeLimit', 300)     # 5 min limit for sensitivity analysis
         model.setParam('Method', 3)          # Concurrent method
         model.setParam('Heuristics', 0.5)    # More heuristics
         
