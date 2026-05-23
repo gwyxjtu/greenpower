@@ -1,0 +1,23 @@
+============================================================
+ Sensitivity Case: D=30.0, phi=0.6, theta=0.3
+ Optimization Terminated! Status: OPTIMAL
+ MIP Gap Target: 1.00%
+ MIP Gap Achieved: 0.9382%
+ Total Annualized Objective: 14858.95 万元/年
+============================================================
+ [Optimal Capacities] 
+ - Wind Power (x_WT): 11.78 MW
+ - Photovoltaic (x_PV): 65.98 MW
+ - Energy Storage (x_ST): 113.57 MWh
+ - Grid Transformer (x_GD): 30.40 MW
+
+ [Cost Breakdown - Real Prices] 
+ - Equipment Investment (one-time): 44262.86 万元
+ - Direct Connection Cost (one-time): 3000.00 万元
+ - Annual Grid Charge: 9083.00 万元/年
+ - Annual Market Revenue: 1370.53 万元/年
+ - Unit Electricity Cost (LCOE, 25-yr lifecycle): 0.2794 元/kWh
+
+ [Energy Statistics] 
+ - Total Renewable Generation: 160851.55 MWh
+ - Total Load Demand: 343659.07 MWh

@@ -33,7 +33,7 @@ def run_optimization(X_GD_bound, output_dir="."):
     model = gp.Model("GreenPowerMicrogrid")
     
     # Optional: set parameters for the solver
-    model.setParam('MIPGap', 0.05)    # 1% gap
+    model.setParam('MIPGap', MAIN_MIP_GAP)    # 1% gap
     model.setParam('TimeLimit', 300)  # 5 min time limit
     model.setParam('Heuristics', 0.5)    # More heuristics
 
@@ -216,14 +216,124 @@ MAX_SENSITIVITY_WORKERS = 8
 DEFAULT_D = 50.0
 DEFAULT_PHI = 0.6
 DEFAULT_THETA = 0.3
+SENSITIVITY_RESULTS_DIR = "results/sensitivity"
+SENSITIVITY_MIP_GAP = 0.01          # bulk sweep stopping tolerance (1%)
+SENSITIVITY_REFINE_MIP_GAP = 0.01   # refined points stopping tolerance (1%)
+MAIN_MIP_GAP = 0.01                 # run_optimization stopping tolerance (1%)
 
 
-def _run_sensitivity_point(D, phi, theta):
+def _format_sensitivity_tag(sweep_key, value):
+    """Build a stable directory name for one sensitivity case."""
+    if sweep_key == "D":
+        v = int(value) if float(value).is_integer() else value
+        return f"D_{v}"
+    return f"{sweep_key}_{float(value):.1f}"
+
+
+def _sensitivity_case_dir(sweep_key, value):
+    return os.path.join(SENSITIVITY_RESULTS_DIR, sweep_key, _format_sensitivity_tag(sweep_key, value))
+
+
+def _solver_status_str(status):
+    if status == GRB.OPTIMAL:
+        return "OPTIMAL"
+    if status == GRB.TIME_LIMIT:
+        return f"TIME_LIMIT (Status {status})"
+    return f"UNFINISHED (Status {status}, Feasible solution found)"
+
+
+def _save_sensitivity_case_files(
+    output_dir,
+    *,
+    D_val,
+    phi_val,
+    theta_val,
+    mip_gap_target,
+    mip_gap_achieved,
+    status,
+    obj_val,
+    x_WT,
+    x_PV,
+    x_ST,
+    x_GD,
+    p_WT,
+    p_PV,
+    p_ST_C,
+    p_ST_D,
+    p_GD,
+    p_GD_U,
+    E,
+    c_inv,
+    c_conn,
+    c_grid,
+    rev_mkt,
+    c_ele,
+):
+    """Write optimization_results.txt and timeseries_results.csv for one sensitivity case."""
+    import csv
+
+    os.makedirs(output_dir, exist_ok=True)
+    results_path = os.path.join(output_dir, "optimization_results.txt")
+    csv_path = os.path.join(output_dir, "timeseries_results.csv")
+
+    total_re = sum((p_WT[t].X + p_PV[t].X) * p.delta for t in range(p.T))
+    total_load = sum(p.load_t[t] for t in range(p.T))
+    status_str = _solver_status_str(status)
+    gap_achieved_str = f"{mip_gap_achieved:.4%}" if mip_gap_achieved is not None else "N/A"
+
+    with open(results_path, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write(f" Sensitivity Case: D={D_val}, phi={phi_val}, theta={theta_val}\n")
+        f.write(f" Optimization Terminated! Status: {status_str}\n")
+        f.write(f" MIP Gap Target: {mip_gap_target:.2%}\n")
+        f.write(f" MIP Gap Achieved: {gap_achieved_str}\n")
+        f.write(f" Total Annualized Objective: {obj_val:.2f} 万元/年\n")
+        f.write("=" * 60 + "\n")
+        f.write(" [Optimal Capacities] \n")
+        f.write(f" - Wind Power (x_WT): {x_WT.X:.2f} MW\n")
+        f.write(f" - Photovoltaic (x_PV): {x_PV.X:.2f} MW\n")
+        f.write(f" - Energy Storage (x_ST): {x_ST.X:.2f} MWh\n")
+        f.write(f" - Grid Transformer (x_GD): {x_GD.X:.2f} MW\n")
+        f.write("\n [Cost Breakdown - Real Prices] \n")
+        f.write(f" - Equipment Investment (one-time): {c_inv:.2f} 万元\n")
+        f.write(f" - Direct Connection Cost (one-time): {c_conn:.2f} 万元\n")
+        f.write(f" - Annual Grid Charge: {c_grid:.2f} 万元/年\n")
+        f.write(f" - Annual Market Revenue: {rev_mkt:.2f} 万元/年\n")
+        f.write(f" - Unit Electricity Cost (LCOE, {p.project_life}-yr lifecycle): {c_ele:.4f} 元/kWh\n")
+        f.write("\n [Energy Statistics] \n")
+        f.write(f" - Total Renewable Generation: {total_re:.2f} MWh\n")
+        f.write(f" - Total Load Demand: {total_load:.2f} MWh\n")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Hour", "Load", "P_WT", "P_PV", "P_ST_Charge", "P_ST_Discharge", "SOC", "P_Grid_Buy", "P_Grid_Sell"])
+        for t in range(p.T):
+            soc_val = (E[t].X / x_ST.X) if x_ST.X > 1e-6 else 0.0
+            writer.writerow([
+                t,
+                round(p.load_t[t], 2),
+                round(p_WT[t].X, 2),
+                round(p_PV[t].X, 2),
+                round(p_ST_C[t].X, 2),
+                round(p_ST_D[t].X, 2),
+                round(soc_val, 4),
+                round(p_GD[t].X, 2),
+                round(p_GD_U[t].X, 2),
+            ])
+
+
+def _run_sensitivity_point(D, phi, theta, mip_gap, output_dir):
     """Process-pool worker: one sensitivity case with explicit parameters."""
-    return run_single_optimization(D=D, phi=phi, theta=theta)
+    return run_single_optimization(
+        D=D,
+        phi=phi,
+        theta=theta,
+        mip_gap=mip_gap,
+        output_dir=output_dir,
+    )
 
 
-def _parallel_sensitivity_sweep(tasks, sort_key):
+def _parallel_sensitivity_sweep(tasks, sort_key, mip_gap=SENSITIVITY_MIP_GAP):
     """
     Run sensitivity cases in parallel (up to MAX_SENSITIVITY_WORKERS).
     Each task is a dict with keys D, phi, theta.
@@ -232,13 +342,20 @@ def _parallel_sensitivity_sweep(tasks, sort_key):
         return []
 
     max_workers = min(len(tasks), MAX_SENSITIVITY_WORKERS)
-    print(f"   Running {len(tasks)} cases in parallel (max_workers={max_workers})...")
+    print(f"   Running {len(tasks)} cases in parallel (max_workers={max_workers}, MIPGap={mip_gap:.0%})...")
     results = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_run_sensitivity_point, t["D"], t["phi"], t["theta"]): t
-            for t in tasks
-        }
+        futures = {}
+        for t in tasks:
+            output_dir = _sensitivity_case_dir(sort_key, t[sort_key])
+            futures[executor.submit(
+                _run_sensitivity_point,
+                t["D"],
+                t["phi"],
+                t["theta"],
+                mip_gap,
+                output_dir,
+            )] = t
         done = 0
         for future in as_completed(futures):
             task = futures[future]
@@ -247,14 +364,112 @@ def _parallel_sensitivity_sweep(tasks, sort_key):
                 result = future.result()
                 if result is not None:
                     results.append(result)
-                    print(f"   [{done}/{len(tasks)}] done: D={task['D']}, phi={task['phi']}, theta={task['theta']}")
+                    gap_str = (
+                        f"{result['mip_gap_achieved']:.2%}"
+                        if result.get("mip_gap_achieved") is not None
+                        else "N/A"
+                    )
+                    print(
+                        f"   [{done}/{len(tasks)}] done: {sort_key}={task[sort_key]}, "
+                        f"gap={gap_str} -> {result['output_dir']}"
+                    )
                 else:
-                    print(f"   [{done}/{len(tasks)}] no solution: D={task['D']}, phi={task['phi']}, theta={task['theta']}")
+                    print(f"   [{done}/{len(tasks)}] no solution: {sort_key}={task[sort_key]}")
             except Exception as exc:
-                print(f"   [{done}/{len(tasks)}] failed: D={task['D']}, phi={task['phi']}, theta={task['theta']}: {exc}")
+                print(f"   [{done}/{len(tasks)}] failed: {sort_key}={task[sort_key]}: {exc}")
 
     results.sort(key=lambda r: r[sort_key])
     return results
+
+
+def _refine_sensitivity_points(results, sort_key, refine_values, fixed_params, mip_gap=SENSITIVITY_REFINE_MIP_GAP):
+    """Re-run selected points with a tighter MIP gap and merge into results."""
+    if not results:
+        return results
+
+    refined = []
+    for val in refine_values:
+        task = {**fixed_params, sort_key: val}
+        output_dir = _sensitivity_case_dir(sort_key, val)
+        print(f"   Refining {sort_key}={val} with MIPGap={mip_gap:.0%}...")
+        result = run_single_optimization(
+            D=task["D"],
+            phi=task["phi"],
+            theta=task["theta"],
+            mip_gap=mip_gap,
+            output_dir=output_dir,
+        )
+        if result is not None:
+            refined.append(result)
+            gap_str = (
+                f"{result['mip_gap_achieved']:.2%}"
+                if result.get("mip_gap_achieved") is not None
+                else "N/A"
+            )
+            print(
+                f"   ✓ {sort_key}={val}: LCOE={result['c_ele']:.4f} 元/kWh, "
+                f"gap={gap_str} -> {result['output_dir']}"
+            )
+        else:
+            print(f"   ✗ {sort_key}={val}: no solution")
+
+    if not refined:
+        return results
+
+    refined_map = {r[sort_key]: r for r in refined}
+    merged = [refined_map.get(r[sort_key], r) for r in results]
+    merged.sort(key=lambda r: r[sort_key])
+    return merged
+
+
+_SENSITIVITY_EXPORT_COLUMNS = [
+    ("D", "Distance (km)"),
+    ("phi", "Min Self-consumption Ratio"),
+    ("theta", "Min RE Generation Ratio"),
+    ("c_ele", "LCOE (元/kWh)"),
+    ("c_inv", "Equipment Investment (万元, one-time)"),
+    ("c_grid", "Annual Grid Cost (万元/yr)"),
+    ("c_conn", "Connection Cost (万元, one-time)"),
+    ("rev_mkt", "Annual Market Revenue (万元/yr)"),
+    ("obj", "Annualized Objective (万元/yr)"),
+    ("mip_gap_target", "MIP Gap Target"),
+    ("mip_gap_achieved", "MIP Gap Achieved"),
+    ("x_WT", "Wind (MW)"),
+    ("x_PV", "PV (MW)"),
+    ("x_ST", "Storage (MWh)"),
+    ("x_GD", "Grid (MW)"),
+    ("output_dir", "Output Directory"),
+]
+
+
+def _save_sensitivity_summary(results, sweep_key, plot_filename, excel_filename, title, xlabel, marker, color):
+    """Save one sensitivity plot and Excel summary."""
+    if not results:
+        return
+
+    x_vals = [r[sweep_key] for r in results]
+    c_ele_vals = [r["c_ele"] for r in results]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(x_vals, c_ele_vals, marker, linewidth=2, markersize=8, color=color)
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel("Unit Electricity Cost (元/kWh)", fontsize=12)
+    plt.title(title, fontsize=14, fontweight="bold")
+    plt.grid(True, alpha=0.3)
+    if sweep_key in ("phi", "theta"):
+        plt.xticks(x_vals)
+    plt.tight_layout()
+    plt.savefig(plot_filename, dpi=300, bbox_inches="tight")
+    print(f"   ✓ Plot saved: {plot_filename}")
+    plt.close()
+
+    df = pd.DataFrame(results)
+    export_cols = [src for src, _ in _SENSITIVITY_EXPORT_COLUMNS if src in df.columns]
+    df_export = df[export_cols].copy()
+    rename_map = {src: label for src, label in _SENSITIVITY_EXPORT_COLUMNS if src in export_cols}
+    df_export.rename(columns=rename_map, inplace=True)
+    df_export.to_excel(excel_filename, index=False, sheet_name=f"{sweep_key} Analysis")
+    print(f"   ✓ Excel saved: {excel_filename}")
 
 
 def run_sensitivity_analysis():
@@ -263,8 +478,9 @@ def run_sensitivity_analysis():
     print(" Sensitivity Analysis: Parameter Impact on Unit Cost")
     print("="*60)
     
-    # Create plot folder if not exists
+    # Create output folders
     os.makedirs("plot", exist_ok=True)
+    os.makedirs(SENSITIVITY_RESULTS_DIR, exist_ok=True)
     
     # ============================================================
     # 1. Sensitivity Analysis: D (Direct Connection Distance)
@@ -276,30 +492,16 @@ def run_sensitivity_analysis():
         for D_val in D_values
     ]
     D_results = _parallel_sensitivity_sweep(D_tasks, sort_key="D")
-    
-    if D_results:
-        d_vals = [r['D'] for r in D_results]
-        c_ele_vals = [r['c_ele'] for r in D_results]
-        
-        plt.figure(figsize=(10, 6))
-        plt.plot(d_vals, c_ele_vals, 'o-', linewidth=2, markersize=8, color='#2E86AB')
-        plt.xlabel('Direct Connection Distance (km)', fontsize=12)
-        plt.ylabel('Unit Electricity Cost (元/kWh)', fontsize=12)
-        plt.title('Impact of Connection Distance on Unit Electricity Cost', fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('plot/D_vs_c_ele.png', dpi=300, bbox_inches='tight')
-        print(f"   ✓ Plot saved: plot/D_vs_c_ele.png")
-        plt.close()
-        
-        # Export D analysis to Excel
-        df_d = pd.DataFrame(D_results)
-        df_d_export = df_d[['D', 'c_ele', 'c_inv', 'c_grid', 'c_conn', 'rev_mkt', 'obj', 'x_WT', 'x_PV', 'x_ST', 'x_GD']]
-        df_d_export.columns = ['Distance (km)', 'LCOE (元/kWh)', 'Equipment Investment (万元, one-time)',
-                               'Annual Grid Cost (万元/yr)', 'Connection Cost (万元, one-time)', 'Annual Market Revenue (万元/yr)',
-                               'Annualized Objective (万元/yr)', 'Wind (MW)', 'PV (MW)', 'Storage (MWh)', 'Grid (MW)']
-        df_d_export.to_excel('plot/sensitivity_D.xlsx', index=False, sheet_name='D Analysis')
-        print(f"   ✓ Excel saved: plot/sensitivity_D.xlsx")
+    _save_sensitivity_summary(
+        D_results,
+        sweep_key="D",
+        plot_filename="plot/D_vs_c_ele.png",
+        excel_filename="plot/sensitivity_D.xlsx",
+        title="Impact of Connection Distance on Unit Electricity Cost",
+        xlabel="Direct Connection Distance (km)",
+        marker="o-",
+        color="#2E86AB",
+    )
     
     # ============================================================
     # 2. Sensitivity Analysis: phi (Min RE self-consumption ratio)
@@ -311,31 +513,16 @@ def run_sensitivity_analysis():
         for phi_val in phi_values
     ]
     phi_results = _parallel_sensitivity_sweep(phi_tasks, sort_key="phi")
-    
-    if phi_results:
-        phi_vals = [r['phi'] for r in phi_results]
-        c_ele_vals = [r['c_ele'] for r in phi_results]
-        
-        plt.figure(figsize=(10, 6))
-        plt.plot(phi_vals, c_ele_vals, 's-', linewidth=2, markersize=8, color='#A23B72')
-        plt.xlabel('Min RE Self-consumption Ratio (φ)', fontsize=12)
-        plt.ylabel('Unit Electricity Cost (元/kWh)', fontsize=12)
-        plt.title('Impact of RE Self-consumption Ratio on Unit Electricity Cost', fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3)
-        plt.xticks(phi_vals)
-        plt.tight_layout()
-        plt.savefig('plot/phi_vs_c_ele.png', dpi=300, bbox_inches='tight')
-        print(f"   ✓ Plot saved: plot/phi_vs_c_ele.png")
-        plt.close()
-        
-        # Export phi analysis to Excel
-        df_phi = pd.DataFrame(phi_results)
-        df_phi_export = df_phi[['phi', 'c_ele', 'c_inv', 'c_grid', 'c_conn', 'rev_mkt', 'obj', 'x_WT', 'x_PV', 'x_ST', 'x_GD']]
-        df_phi_export.columns = ['Min Self-consumption Ratio', 'LCOE (元/kWh)', 'Equipment Investment (万元, one-time)',
-                                 'Annual Grid Cost (万元/yr)', 'Connection Cost (万元, one-time)', 'Annual Market Revenue (万元/yr)',
-                                 'Annualized Objective (万元/yr)', 'Wind (MW)', 'PV (MW)', 'Storage (MWh)', 'Grid (MW)']
-        df_phi_export.to_excel('plot/sensitivity_phi.xlsx', index=False, sheet_name='Phi Analysis')
-        print(f"   ✓ Excel saved: plot/sensitivity_phi.xlsx")
+    _save_sensitivity_summary(
+        phi_results,
+        sweep_key="phi",
+        plot_filename="plot/phi_vs_c_ele.png",
+        excel_filename="plot/sensitivity_phi.xlsx",
+        title="Impact of RE Self-consumption Ratio on Unit Electricity Cost",
+        xlabel="Min RE Self-consumption Ratio (φ)",
+        marker="s-",
+        color="#A23B72",
+    )
     
     # ============================================================
     # 3. Sensitivity Analysis: theta (Min RE generation to load ratio)
@@ -347,42 +534,35 @@ def run_sensitivity_analysis():
         for theta_val in theta_values
     ]
     theta_results = _parallel_sensitivity_sweep(theta_tasks, sort_key="theta")
-    
-    if theta_results:
-        theta_vals = [r['theta'] for r in theta_results]
-        c_ele_vals = [r['c_ele'] for r in theta_results]
-        
-        plt.figure(figsize=(10, 6))
-        plt.plot(theta_vals, c_ele_vals, '^-', linewidth=2, markersize=8, color='#F18F01')
-        plt.xlabel('Min RE Generation to Load Ratio (θ)', fontsize=12)
-        plt.ylabel('Unit Electricity Cost (元/kWh)', fontsize=12)
-        plt.title('Impact of RE Generation Ratio on Unit Electricity Cost', fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3)
-        plt.xticks(theta_vals)
-        plt.tight_layout()
-        plt.savefig('plot/theta_vs_c_ele.png', dpi=300, bbox_inches='tight')
-        print(f"   ✓ Plot saved: plot/theta_vs_c_ele.png")
-        plt.close()
-        
-        # Export theta analysis to Excel
-        df_theta = pd.DataFrame(theta_results)
-        df_theta_export = df_theta[['theta', 'c_ele', 'c_inv', 'c_grid', 'c_conn', 'rev_mkt', 'obj', 'x_WT', 'x_PV', 'x_ST', 'x_GD']]
-        df_theta_export.columns = ['Min RE Generation Ratio', 'LCOE (元/kWh)', 'Equipment Investment (万元, one-time)',
-                                   'Annual Grid Cost (万元/yr)', 'Connection Cost (万元, one-time)', 'Annual Market Revenue (万元/yr)',
-                                   'Annualized Objective (万元/yr)', 'Wind (MW)', 'PV (MW)', 'Storage (MWh)', 'Grid (MW)']
-        df_theta_export.to_excel('plot/sensitivity_theta.xlsx', index=False, sheet_name='Theta Analysis')
-        print(f"   ✓ Excel saved: plot/sensitivity_theta.xlsx")
+    theta_results = _refine_sensitivity_points(
+        theta_results,
+        sort_key="theta",
+        refine_values=[0.3, 0.9],
+        fixed_params={"D": DEFAULT_D, "phi": DEFAULT_PHI},
+    )
+    _save_sensitivity_summary(
+        theta_results,
+        sweep_key="theta",
+        plot_filename="plot/theta_vs_c_ele.png",
+        excel_filename="plot/sensitivity_theta.xlsx",
+        title="Impact of RE Generation Ratio on Unit Electricity Cost",
+        xlabel="Min RE Generation to Load Ratio (θ)",
+        marker="^-",
+        color="#F18F01",
+    )
     
     print("\n" + "="*60)
     print(" All sensitivity analysis plots and data exported!")
     print("="*60)
 
-def run_single_optimization(D=None, phi=None, theta=None):
+def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MIP_GAP, output_dir=None):
     """
     Run single optimization and return key results.
     Used for sensitivity analysis.
 
     D, phi, theta: optional overrides (defaults from params module).
+    mip_gap: Gurobi MIP optimality gap tolerance (stopping criterion).
+    output_dir: if set, save optimization_results.txt and timeseries_results.csv.
     """
     D_val = p.D if D is None else D
     phi_val = p.phi if phi is None else phi
@@ -392,7 +572,7 @@ def run_single_optimization(D=None, phi=None, theta=None):
         # Create model
         model = gp.Model("GreenPowerMicrogrid")
         model.setParam('OutputFlag', 0)      # Suppress output
-        model.setParam('MIPGap', 0.05)       # 5% gap for faster solving
+        model.setParam('MIPGap', mip_gap)
         # model.setParam('TimeLimit', 300)     # 5 min limit for sensitivity analysis
         model.setParam('Method', 3)          # Concurrent method
         model.setParam('Heuristics', 0.5)    # More heuristics
@@ -462,6 +642,7 @@ def run_single_optimization(D=None, phi=None, theta=None):
         model.optimize()
         
         if model.SolCount > 0:
+            mip_gap_achieved = model.MIPGap
             # Real (un-annualized) cost breakdown
             N = p.project_life  # project lifetime in years
             c_inv = p.lambda_WT * x_WT.X + p.lambda_PV * x_PV.X + p.lambda_ST * x_ST.X + p.lambda_GD * x_GD.X
@@ -471,6 +652,34 @@ def run_single_optimization(D=None, phi=None, theta=None):
             total_load = sum(p.load_t[t] for t in range(p.T))
             # LCOE = lifetime total net cost / lifetime total energy; ×10 converts 万元/MWh -> 元/kWh
             c_ele = ((c_inv + c_conn) + N * (c_grid - rev_mkt)) / (N * total_load) * 10 if total_load > 0 else 0
+
+            if output_dir is not None:
+                _save_sensitivity_case_files(
+                    output_dir,
+                    D_val=D_val,
+                    phi_val=phi_val,
+                    theta_val=theta_val,
+                    mip_gap_target=mip_gap,
+                    mip_gap_achieved=mip_gap_achieved,
+                    status=model.Status,
+                    obj_val=model.ObjVal,
+                    x_WT=x_WT,
+                    x_PV=x_PV,
+                    x_ST=x_ST,
+                    x_GD=x_GD,
+                    p_WT=p_WT,
+                    p_PV=p_PV,
+                    p_ST_C=p_ST_C,
+                    p_ST_D=p_ST_D,
+                    p_GD=p_GD,
+                    p_GD_U=p_GD_U,
+                    E=E,
+                    c_inv=c_inv,
+                    c_conn=c_conn,
+                    c_grid=c_grid,
+                    rev_mkt=rev_mkt,
+                    c_ele=c_ele,
+                )
             
             return {
                 'D': D_val,
@@ -482,10 +691,14 @@ def run_single_optimization(D=None, phi=None, theta=None):
                 'c_conn': c_conn,         # 直连建设费(一次性,万元)
                 'rev_mkt': rev_mkt,       # 年市场收益(万元/年)
                 'obj': model.ObjVal,
+                'mip_gap_target': mip_gap,
+                'mip_gap_achieved': mip_gap_achieved,
+                'status': model.Status,
                 'x_WT': x_WT.X,
                 'x_PV': x_PV.X,
                 'x_ST': x_ST.X,
-                'x_GD': x_GD.X
+                'x_GD': x_GD.X,
+                'output_dir': output_dir,
             }
     except Exception as e:
         print(f"   Error in optimization: {e}")
