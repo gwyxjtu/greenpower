@@ -4,6 +4,7 @@ import time
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter, ScalarFormatter
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -54,7 +55,7 @@ def run_optimization(X_GD_bound, output_dir="."):
     p_ST_C = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_C")
     p_ST_D = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_D")
     p_GD = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD")
-    p_GD_U = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD_U")
+    p_GD_U = model.addVars(p.T, ub=0, vtype=GRB.CONTINUOUS, name="p_GD_U")
     
     # Energy variables to linearize SOC_t * x_ST (E_t = SOC_t * x_ST)
     E = model.addVars(p.T + 1, lb=0, vtype=GRB.CONTINUOUS, name="E")
@@ -130,7 +131,8 @@ def run_optimization(X_GD_bound, output_dir="."):
     
     # (7) Renewable energy generation constraints
     model.addConstr(sum_re - sum_gd_u >= p.phi * sum_re, name="c_re_prop1")
-    model.addConstr(sum_re >= p.theta * p.L, name="c_re_prop2")
+    sum_load = gp.quicksum(p.load_t[t] * p.delta for t in range(p.T))
+    model.addConstr(sum_re >= p.theta * sum_load, name="c_re_prop2")
     
     # ============================================================
     # 4. Model Optimization
@@ -217,7 +219,7 @@ DEFAULT_D = 50.0
 DEFAULT_PHI = 0.6
 DEFAULT_THETA = 0.3
 SENSITIVITY_RESULTS_DIR = "results/sensitivity"
-SENSITIVITY_MIP_GAP = 0.01          # bulk sweep stopping tolerance (1%)
+SENSITIVITY_MIP_GAP = 0.05          # bulk sweep stopping tolerance (1%)
 SENSITIVITY_REFINE_MIP_GAP = 0.01   # refined points stopping tolerance (1%)
 MAIN_MIP_GAP = 0.01                 # run_optimization stopping tolerance (1%)
 
@@ -451,13 +453,27 @@ def _save_sensitivity_summary(results, sweep_key, plot_filename, excel_filename,
     c_ele_vals = [r["c_ele"] for r in results]
 
     plt.figure(figsize=(10, 6))
-    plt.plot(x_vals, c_ele_vals, marker, linewidth=2, markersize=8, color=color)
-    plt.xlabel(xlabel, fontsize=12)
-    plt.ylabel("Unit Electricity Cost (元/kWh)", fontsize=12)
-    plt.title(title, fontsize=14, fontweight="bold")
-    plt.grid(True, alpha=0.3)
+    ax = plt.gca()
+    ax.plot(x_vals, c_ele_vals, marker, linewidth=2, markersize=8, color=color)
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel("Unit Electricity Cost (元/kWh)", fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.grid(True, alpha=0.3)
     if sweep_key in ("phi", "theta"):
-        plt.xticks(x_vals)
+        ax.set_xticks(x_vals)
+
+    # Show actual LCOE values; disable Matplotlib offset/scientific notation (e.g. 1e-6+4.4125e-1).
+    y_min, y_max = min(c_ele_vals), max(c_ele_vals)
+    y_span = y_max - y_min
+    y_pad = max(y_span * 0.15, 0.002)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+    if y_span < 0.01:
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.5f"))
+    else:
+        formatter = ScalarFormatter(useOffset=False)
+        formatter.set_scientific(False)
+        ax.yaxis.set_major_formatter(formatter)
+
     plt.tight_layout()
     plt.savefig(plot_filename, dpi=300, bbox_inches="tight")
     print(f"   ✓ Plot saved: {plot_filename}")
@@ -485,23 +501,23 @@ def run_sensitivity_analysis():
     # ============================================================
     # 1. Sensitivity Analysis: D (Direct Connection Distance)
     # ============================================================
-    print("\n1. Analyzing impact of D (connection distance)...")
-    D_values = np.arange(10, 90, 10)  # 10 to 80 km, step 10
-    D_tasks = [
-        {"D": float(D_val), "phi": DEFAULT_PHI, "theta": DEFAULT_THETA}
-        for D_val in D_values
-    ]
-    D_results = _parallel_sensitivity_sweep(D_tasks, sort_key="D")
-    _save_sensitivity_summary(
-        D_results,
-        sweep_key="D",
-        plot_filename="plot/D_vs_c_ele.png",
-        excel_filename="plot/sensitivity_D.xlsx",
-        title="Impact of Connection Distance on Unit Electricity Cost",
-        xlabel="Direct Connection Distance (km)",
-        marker="o-",
-        color="#2E86AB",
-    )
+    # print("\n1. Analyzing impact of D (connection distance)...")
+    # D_values = np.arange(10, 100, 10)  # 10 to 80 km, step 10
+    # D_tasks = [
+    #     {"D": float(D_val), "phi": DEFAULT_PHI, "theta": DEFAULT_THETA}
+    #     for D_val in D_values
+    # ]
+    # D_results = _parallel_sensitivity_sweep(D_tasks, sort_key="D")
+    # _save_sensitivity_summary(
+    #     D_results,
+    #     sweep_key="D",
+    #     plot_filename="plot/D_vs_c_ele.png",
+    #     excel_filename="plot/sensitivity_D.xlsx",
+    #     title="Impact of Connection Distance on Unit Electricity Cost",
+    #     xlabel="Direct Connection Distance (km)",
+    #     marker="o-",
+    #     color="#2E86AB",
+    # )
     
     # ============================================================
     # 2. Sensitivity Analysis: phi (Min RE self-consumption ratio)
@@ -524,9 +540,9 @@ def run_sensitivity_analysis():
         color="#A23B72",
     )
     
-    # ============================================================
-    # 3. Sensitivity Analysis: theta (Min RE generation to load ratio)
-    # ============================================================
+    # # ============================================================
+    # # 3. Sensitivity Analysis: theta (Min RE generation to load ratio)
+    # # ============================================================
     print("\n3. Analyzing impact of theta (RE generation ratio)...")
     theta_values = np.arange(0.1, 1.0, 0.1)
     theta_tasks = [
@@ -534,12 +550,12 @@ def run_sensitivity_analysis():
         for theta_val in theta_values
     ]
     theta_results = _parallel_sensitivity_sweep(theta_tasks, sort_key="theta")
-    theta_results = _refine_sensitivity_points(
-        theta_results,
-        sort_key="theta",
-        refine_values=[0.3, 0.9],
-        fixed_params={"D": DEFAULT_D, "phi": DEFAULT_PHI},
-    )
+    # theta_results = _refine_sensitivity_points(
+    #     theta_results,
+    #     sort_key="theta",
+    #     refine_values=[0.3, 0.9],
+    #     fixed_params={"D": DEFAULT_D, "phi": DEFAULT_PHI},
+    # )
     _save_sensitivity_summary(
         theta_results,
         sweep_key="theta",
@@ -581,14 +597,14 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         x_WT = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_WT")
         x_PV = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_PV")
         x_ST = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_ST")
-        x_GD = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_GD")
+        x_GD = model.addVar(lb=30,ub=30, vtype=GRB.CONTINUOUS, name="x_GD")
         
         p_WT = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_WT")
         p_PV = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_PV")
         p_ST_C = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_C")
         p_ST_D = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_D")
         p_GD = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD")
-        p_GD_U = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD_U")
+        p_GD_U = model.addVars(p.T, lb=0,ub=0, vtype=GRB.CONTINUOUS, name="p_GD_U")
         
         E = model.addVars(p.T + 1, lb=0, vtype=GRB.CONTINUOUS, name="E")
         
@@ -636,7 +652,8 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         
         model.addConstr(sum_gd_u <= p.psi * sum_re, name="c_grid_prop")
         model.addConstr(sum_re - sum_gd_u >= phi_val * sum_re, name="c_re_prop1")
-        model.addConstr(sum_re >= theta_val * p.L, name="c_re_prop2")
+        sum_load = gp.quicksum(p.load_t[t] * p.delta for t in range(p.T))
+        model.addConstr(sum_re >= theta_val * sum_load, name="c_re_prop2")
         
         # Optimize
         model.optimize()

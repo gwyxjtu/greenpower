@@ -73,7 +73,7 @@ P_ST_MAX_D = 50.0     # Maximum discharging power (MW)
 # ============================================================
 psi   = 0.2           # Max ratio of on-grid electricity to total RE generation
 phi   = 0.6           # Min RE self-consumption ratio                                              # plot phi-c_ele, phi scales from 0.1-0.9 (0.1 stepsize)
-theta = 0.3           # Min ratio of total RE generation to load                             # plot theta-c_ele, phi scales from 0.1-0.9 (0.1 stepsize)
+theta = 0.3           # Min ratio of annual RE generation to annual load energy (MWh/MWh)  # plot theta-c_ele, theta scales from 0.1-0.9 (0.1 stepsize)
 
 
 # ============================================================
