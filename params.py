@@ -28,13 +28,14 @@ lambda_GD = 12.0      # Grid transformer unit price (万元/MW)
 # 3. Electricity Price Parameters
 # ============================================================
 mu_DC  = 3.0         # Monthly demand charge (万元/MW/month)
-mu_ELE = 0.05         # Electricity unit price (万元/MWh)
+mu_ELE = 0.005         # Electricity unit price (万元/MWh)
+mu_BUY = 0.05         # Grid electricity purchase price (万元/MWh) = 0.5 元/kWh
 
 # ============================================================
 # 4. Economic Parameters
 # ============================================================
 discount_rate = 0.08  # Annual discount rate (%)
-project_life = 25     # Project lifetime (years)
+project_life = 15     # Project lifetime (years)
 
 # Calculate Capital Recovery Factor (CRF)
 # CRF = r * (1 + r)^n / ((1 + r)^n - 1)

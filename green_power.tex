@@ -26,14 +26,16 @@ Taking minimizing investment cost as an example, to make the capacity configurat
 1. Define the objective function
 \begin{align}
 J = & r\left(\lambda_{WT} x_{WT} + \lambda_{PV} x_{PV} + \lambda_{ST} x_{ST} +\lambda_{GD} x_{GD}\right) \\ \nonumber
-& + M\left(\mu_{DC}x_{GD} +730 \mu_{ELE} x_{GD} \overline{L}\right) + \nu * D \\ \nonumber 
+& + M \cdot \mu_{DC} x_{GD} + \sum_{t=0}^{T-1} \mu_{BUY} p_{GD,t} \delta + \nu * D \\ \nonumber 
 & -\sum_{t=0}^{T-1}\mu_{MKT,t}p_{GD,t}^{U} 
 \end{align}
 Where:
 
 \noindent - $\lambda_{WT},\lambda_{PV},\lambda_{ST},\lambda_{GD}$: unit price on wind turbine, PV panel, storage battery and transformer; 
 
-\noindent - $\mu_{DC},\mu_{ELE}$: unit price on demand charge and electricity with relevant voltage;
+\noindent - $\mu_{DC}$: monthly demand charge (万元/MW/month);
+
+\noindent - $\mu_{BUY}$: grid electricity purchase price (万元/MWh);
 
 \noindent - $r$: weight on annual operational cost;
 

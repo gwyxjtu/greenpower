@@ -73,10 +73,13 @@ def run_optimization(X_GD_bound, output_dir="."):
     
     cost_investment = p.CRF * (p.lambda_WT * x_WT + p.lambda_PV * x_PV + p.lambda_ST * x_ST + p.lambda_GD * x_GD)
     cost_grid_fixed = p.M * (p.mu_DC * x_GD + 730 * p.mu_ELE * x_GD * p.L_bar)
-    cost_connection = p.nu * p.D
+    # cost_grid_demand = p.M * p.mu_DC * x_GD                  # Capacity/demand charge (万元/年)
+    cost_grid_energy = gp.quicksum(p.mu_BUY * p_GD[t] * p.delta for t in range(p.T))  # Energy purchase cost (万元/年)
+    # cost_grid_fixed = cost_grid_demand + cost_grid_energy
+    cost_connection = p.nu * p.D * p.CRF
     revenue_market = gp.quicksum(p.mu_MKT_t[t] * p_GD_U[t] for t in range(p.T))
     
-    J = cost_investment +  cost_grid_fixed + cost_connection - revenue_market      # append capital recovery factor
+    J = cost_investment +  cost_grid_fixed + cost_grid_energy + cost_connection - revenue_market      # append capital recovery factor
     
     model.setObjective(J, GRB.MINIMIZE)
     
@@ -130,7 +133,7 @@ def run_optimization(X_GD_bound, output_dir="."):
     model.addConstr(sum_gd_u <= p.psi * sum_re, name="c_grid_prop")
     
     # (7) Renewable energy generation constraints
-    model.addConstr(sum_re - sum_gd_u >= p.phi * sum_re, name="c_re_prop1")
+    model.addConstr(sum_re - sum_gd_u >= p.phi * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_re_prop1")
     sum_load = gp.quicksum(p.load_t[t] * p.delta for t in range(p.T))
     model.addConstr(sum_re >= p.theta * sum_load, name="c_re_prop2")
     
@@ -162,19 +165,25 @@ def run_optimization(X_GD_bound, output_dir="."):
             c_inv = p.lambda_WT * x_WT.X + p.lambda_PV * x_PV.X + p.lambda_ST * x_ST.X + p.lambda_GD * x_GD.X
             c_conn = p.nu * p.D
             c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ELE * x_GD.X * p.L_bar)
+            c_grid_energy = sum(p.mu_BUY * p_GD[t].X * p.delta for t in range(p.T))
             rev_mkt = sum(p.mu_MKT_t[t] * p_GD_U[t].X for t in range(p.T))
             total_load = sum(p.load_t[t] for t in range(p.T))
             # LCOE = lifetime total net cost / lifetime total energy
             # c_inv & c_conn are one-time; c_grid & rev_mkt are annual; ×10 converts 万元/MWh -> 元/kWh
-            c_ele = ((c_inv + c_conn) + N * (c_grid - rev_mkt)) / (N * total_load) * 10
+            c_ele = ((c_inv + c_conn) + N * (c_grid + c_grid_energy - rev_mkt)) / (N * total_load) * 10
             
             f.write("\n [Cost Breakdown - Real Prices] \n")
             f.write(f" - Equipment Investment (one-time): {c_inv:.2f} 万元\n")
             f.write(f" - Direct Connection Cost (one-time): {c_conn:.2f} 万元\n")
-            f.write(f" - Annual Grid Charge: {c_grid:.2f} 万元/年\n")
+            f.write(f" - Annual Grid Demand Charge: {c_grid:.2f} 万元/年\n")
+            f.write(f" - Annual Grid Energy Cost: {c_grid_energy:.2f} 万元/年\n")
+            f.write(f" - Annual Grid Charge (total): {c_grid + c_grid_energy:.2f} 万元/年\n")
             f.write(f" - Annual Market Revenue: {rev_mkt:.2f} 万元/年\n")
             f.write(f" - Unit Electricity Cost (LCOE, {N}-yr lifecycle): {c_ele:.4f} 元/kWh\n")
-
+            sum_re_res = [p_PV[t].x + p_WT[t].x for t in range(p.T)]
+            sum_gd_u_res = [p_GD_U[t].x for t in range(p.T)]
+            phi_val = (sum(sum_re_res) - sum(sum_gd_u_res)) / gp.quicksum((p.alpha_WT_t[t] * x_WT.x + p.alpha_PV_t[t] * x_PV.x) * p.delta for t in range(p.T))
+            f.write(f" - phi: {phi_val:}\n")
             
             total_re = sum((p_WT[t].X + p_PV[t].X) * p.delta for t in range(p.T))
             total_load = sum(p.load_t[t] for t in range(p.T))
@@ -267,6 +276,8 @@ def _save_sensitivity_case_files(
     E,
     c_inv,
     c_conn,
+    c_grid_demand,
+    c_grid_energy,
     c_grid,
     rev_mkt,
     c_ele,
@@ -299,7 +310,9 @@ def _save_sensitivity_case_files(
         f.write("\n [Cost Breakdown - Real Prices] \n")
         f.write(f" - Equipment Investment (one-time): {c_inv:.2f} 万元\n")
         f.write(f" - Direct Connection Cost (one-time): {c_conn:.2f} 万元\n")
-        f.write(f" - Annual Grid Charge: {c_grid:.2f} 万元/年\n")
+        f.write(f" - Annual Grid Demand Charge: {c_grid_demand:.2f} 万元/年\n")
+        f.write(f" - Annual Grid Energy Cost: {c_grid_energy:.2f} 万元/年\n")
+        f.write(f" - Annual Grid Charge (total): {c_grid:.2f} 万元/年\n")
         f.write(f" - Annual Market Revenue: {rev_mkt:.2f} 万元/年\n")
         f.write(f" - Unit Electricity Cost (LCOE, {p.project_life}-yr lifecycle): {c_ele:.4f} 元/kWh\n")
         f.write("\n [Energy Statistics] \n")
@@ -430,6 +443,8 @@ _SENSITIVITY_EXPORT_COLUMNS = [
     ("theta", "Min RE Generation Ratio"),
     ("c_ele", "LCOE (元/kWh)"),
     ("c_inv", "Equipment Investment (万元, one-time)"),
+    ("c_grid_demand", "Annual Grid Demand Charge (万元/yr)"),
+    ("c_grid_energy", "Annual Grid Energy Cost (万元/yr)"),
     ("c_grid", "Annual Grid Cost (万元/yr)"),
     ("c_conn", "Connection Cost (万元, one-time)"),
     ("rev_mkt", "Annual Market Revenue (万元/yr)"),
@@ -597,7 +612,7 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         x_WT = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_WT")
         x_PV = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_PV")
         x_ST = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_ST")
-        x_GD = model.addVar(lb=30,ub=30, vtype=GRB.CONTINUOUS, name="x_GD")
+        x_GD = model.addVar(lb=60,ub=60, vtype=GRB.CONTINUOUS, name="x_GD")
         
         p_WT = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_WT")
         p_PV = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_PV")
@@ -616,10 +631,11 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         # Objective
         cost_investment = p.CRF * (p.lambda_WT * x_WT + p.lambda_PV * x_PV + p.lambda_ST * x_ST + p.lambda_GD * x_GD)
         cost_grid_fixed = p.M * (p.mu_DC * x_GD + 730 * p.mu_ELE * x_GD * p.L_bar)
-        cost_connection = p.nu * D_val
+        cost_grid_energy = gp.quicksum(p.mu_BUY * p_GD[t] * p.delta for t in range(p.T))  # Energy purchase cost (万元/年)
+        cost_connection = p.nu * D_val * p.CRF
         revenue_market = gp.quicksum(p.mu_MKT_t[t] * p_GD_U[t] for t in range(p.T))
         
-        J = cost_investment + cost_grid_fixed + cost_connection - revenue_market
+        J = cost_investment + cost_grid_fixed + cost_grid_energy + cost_connection - revenue_market
         model.setObjective(J, GRB.MINIMIZE)
         
         # Constraints
@@ -651,7 +667,7 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         sum_re = gp.quicksum((p_WT[t] + p_PV[t]) * p.delta for t in range(p.T))
         
         model.addConstr(sum_gd_u <= p.psi * sum_re, name="c_grid_prop")
-        model.addConstr(sum_re - sum_gd_u >= phi_val * sum_re, name="c_re_prop1")
+        model.addConstr(sum_re - sum_gd_u >= phi_val * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_re_prop1")
         sum_load = gp.quicksum(p.load_t[t] * p.delta for t in range(p.T))
         model.addConstr(sum_re >= theta_val * sum_load, name="c_re_prop2")
         
@@ -665,10 +681,11 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
             c_inv = p.lambda_WT * x_WT.X + p.lambda_PV * x_PV.X + p.lambda_ST * x_ST.X + p.lambda_GD * x_GD.X
             c_conn = p.nu * D_val
             c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ELE * x_GD.X * p.L_bar)
+            c_grid_energy = sum(p.mu_BUY * p_GD[t].X * p.delta for t in range(p.T))
             rev_mkt = sum(p.mu_MKT_t[t] * p_GD_U[t].X for t in range(p.T))
             total_load = sum(p.load_t[t] for t in range(p.T))
             # LCOE = lifetime total net cost / lifetime total energy; ×10 converts 万元/MWh -> 元/kWh
-            c_ele = ((c_inv + c_conn) + N * (c_grid - rev_mkt)) / (N * total_load) * 10 if total_load > 0 else 0
+            c_ele = ((c_inv + c_conn) + N * (c_grid + c_grid_energy - rev_mkt)) / (N * total_load) * 10 if total_load > 0 else 0
 
             if output_dir is not None:
                 _save_sensitivity_case_files(
@@ -693,7 +710,9 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
                     E=E,
                     c_inv=c_inv,
                     c_conn=c_conn,
-                    c_grid=c_grid,
+                    c_grid_demand=c_grid,
+                    c_grid_energy=c_grid_energy,
+                    c_grid=(c_grid + c_grid_energy),
                     rev_mkt=rev_mkt,
                     c_ele=c_ele,
                 )
@@ -704,7 +723,9 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
                 'theta': theta_val,
                 'c_ele': c_ele,
                 'c_inv': c_inv,           # 设备投资总额(一次性,万元)
-                'c_grid': c_grid,         # 年电网费(万元/年)
+                'c_grid_demand': c_grid,           # 年容量+基础电费(万元/年)
+                'c_grid_energy': c_grid_energy,  # 年购电电度费(万元/年)
+                'c_grid': c_grid + c_grid_energy, # 年电网费合计(万元/年)
                 'c_conn': c_conn,         # 直连建设费(一次性,万元)
                 'rev_mkt': rev_mkt,       # 年市场收益(万元/年)
                 'obj': model.ObjVal,
@@ -750,5 +771,5 @@ if __name__ == "__main__":
     # else:
     #     for X_GD_bound in X_GD_bounds:
     #         _run_optimization_job(X_GD_bound)
-    # run_optimization(0)
+    # run_optimization(60)
     run_sensitivity_analysis()
