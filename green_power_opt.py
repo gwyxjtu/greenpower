@@ -130,7 +130,7 @@ def run_optimization(X_GD_bound, output_dir="."):
     sum_gd_u = gp.quicksum(p_GD_U[t] * p.delta for t in range(p.T))
     sum_re = gp.quicksum((p_WT[t] + p_PV[t]) * p.delta for t in range(p.T))
     
-    model.addConstr(sum_gd_u <= p.psi * sum_re, name="c_grid_prop")
+    model.addConstr(sum_gd_u <= p.psi * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_grid_prop")
     
     # (7) Renewable energy generation constraints
     model.addConstr(sum_re - sum_gd_u >= p.phi * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_re_prop1")
@@ -666,10 +666,10 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         sum_gd_u = gp.quicksum(p_GD_U[t] * p.delta for t in range(p.T))
         sum_re = gp.quicksum((p_WT[t] + p_PV[t]) * p.delta for t in range(p.T))
         
-        model.addConstr(sum_gd_u <= p.psi * sum_re, name="c_grid_prop")
-        model.addConstr(sum_re - sum_gd_u >= phi_val * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_re_prop1")
+        model.addConstr(sum_gd_u <= p.psi * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_grid_prop")
+        model.addConstr(sum_re - sum_gd_u == phi_val * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_re_prop1")
         sum_load = gp.quicksum(p.load_t[t] * p.delta for t in range(p.T))
-        model.addConstr(sum_re >= theta_val * sum_load, name="c_re_prop2")
+        model.addConstr(sum_re == theta_val * sum_load, name="c_re_prop2")
         
         # Optimize
         model.optimize()

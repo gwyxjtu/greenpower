@@ -19,8 +19,8 @@ delta = 1.0       # Duration of each time step (hours)
 # ============================================================
 # 2. Equipment Unit Prices (万元/MW or 万元/MWh)
 # ============================================================
-lambda_WT = 600.0     # Wind turbine unit price (万元/MW)
-lambda_PV = 300.0     # PV panel unit price (万元/MW)
+lambda_WT = 800.0     # Wind turbine unit price (万元/MW)
+lambda_PV = 400.0     # PV panel unit price (万元/MW)
 lambda_ST = 150.0     # Energy storage unit price (万元/MWh)
 lambda_GD = 12.0      # Grid transformer unit price (万元/MW)
 
@@ -28,8 +28,8 @@ lambda_GD = 12.0      # Grid transformer unit price (万元/MW)
 # 3. Electricity Price Parameters
 # ============================================================
 mu_DC  = 3.0         # Monthly demand charge (万元/MW/month)
-mu_ELE = 0.005         # Electricity unit price (万元/MWh)
-mu_BUY = 0.05         # Grid electricity purchase price (万元/MWh) = 0.5 元/kWh
+mu_ELE = 0.01         # Electricity unit price (万元/MWh)
+mu_BUY = 0.04         # Grid electricity purchase price (万元/MWh) = 0.5 元/kWh
 
 # ============================================================
 # 4. Economic Parameters
