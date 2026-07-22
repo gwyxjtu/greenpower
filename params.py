@@ -21,23 +21,69 @@ delta = 1.0       # Duration of each time step (hours)
 # ============================================================
 lambda_WT = 800.0     # Wind turbine unit price (万元/MW)
 lambda_PV = 400.0     # PV panel unit price (万元/MW)
-lambda_ST = 150.0     # Energy storage unit price (万元/MWh)
+lambda_ST = 80.0      # Energy storage unit price (万元/MWh)
 lambda_GD = 12.0      # Grid transformer unit price (万元/MW)
 
 # ============================================================
 # 3. Electricity Price Parameters
+# ------------------------------------------------------------
+# 单位约定（与模型一致）：
+#   电量类: 万元/MWh  ≡  0.1 × (元/kWh)
+#   容量类: 万元/MW/月 ≡ 0.1 × (元/kW/月)
+# 场景锚定：宁夏 / 110kV 两部制工商业（交底书算例为宁夏中卫）
 # ============================================================
-mu_DC  = 3.0         # Monthly demand charge (万元/MW/month)
-mu_ELE = 0.01         # Electricity unit price (万元/MWh)
-mu_BUY = 0.04         # Grid electricity purchase price (万元/MWh) = 0.5 元/kWh
+
+# μ^{DC}: 容(需)量电价。宁夏第三监管周期 110kV 需量电价 25.6 元/kW·月
+# 来源：宁发改价格〔2023〕314号 / 第三监管周期宁夏电网输配电价表
+mu_DC = 2.56          # 万元/MW/month
+
+# μ^{ED}: 电度输配电价。宁夏 110kV 两部制 0.0600 元/kWh
+# 来源：同上
+mu_ED = 0.0060        # 万元/MWh  (= 0.060 元/kWh)
+
+# μ^{EO}: 系统运行费折价（辅助服务、煤电/抽蓄容量电费等分摊，月度浮动）
+# 东部省份常见约 0.02–0.04 元/kWh；西部相对偏低，取中位偏低
+# 参考：各省电网企业代理购电月度公告（如皖/苏约 0.02–0.038）
+mu_EO = 0.0015        # 万元/MWh  (= 0.015 元/kWh)
+
+# μ^{EL}: 上网环节线损电价 ≈ 上网电价 × 综合线损率
+# 宁夏综合线损率 2.59%（第三监管周期）；取购电价≈0.35 元/kWh → ≈0.009 元/kWh
+# 来源：宁夏输配电价表注（线损率 2.59%）
+mu_EL = 0.0009        # 万元/MWh  (= 0.009 元/kWh)
+
+# μ^{EG}: 政府性基金及附加
+# 宁夏：重大水利 0.1125 分 + 移民扶持 0.12 分 + 可再生附加 1.9 分 ≈ 0.0213 元/kWh
+# 来源：宁夏第三监管周期输配电价表注释；全国可再生附加多为 1.9 分/kWh
+mu_EG = 0.00213       # 万元/MWh  (= 0.0213 元/kWh)
+
+# μ^{EB}: 电力市场/代理购电电能量价格（不含输配、基金等，后者已分项）
+# 西部代理购电常见约 0.30–0.40 元/kWh，取 0.35
+mu_EB = 0.035         # 万元/MWh  (= 0.35 元/kWh)
+
+# μ^{PV}/μ^{WT}: 风光自发自用内部转移价，按电力市场 PPA/长协（机制电价）参考
+# 宁夏 2025–2026 新能源机制电价竞价出清 0.2595 元/kWh（=燃煤标杆上限）
+# 来源：宁夏发改委机制电价竞价结果公示；须严格小于 μ^{EB}（相对电网购电有价差）
+mu_PV = 0.02595       # 万元/MWh  (= 0.2595 元/kWh)
+mu_WT = 0.02595       # 万元/MWh  (= 0.2595 元/kWh)
+assert mu_PV < mu_EB and mu_WT < mu_EB, "内部转移价 μ^{PV}/μ^{WT} 必须小于购电价 μ^{EB}"
+
+# μ^{TL}: 绿电直连专线单位造价
+# 行业公开口径约 100 万元/km（含线路；升压站另计）
+# 来源：经济观察网等绿电直连成本访谈（2025）
+mu_TL = 100.0         # 万元/km
+
+# Backward-compatible aliases
+mu_ELE = mu_ED
+mu_BUY = mu_EB
+nu = mu_TL
 
 # ============================================================
 # 4. Economic Parameters
 # ============================================================
-discount_rate = 0.08  # Annual discount rate (%)
+discount_rate = 0.08  # Annual discount rate
 project_life = 15     # Project lifetime (years)
 
-# Calculate Capital Recovery Factor (CRF)
+# Calculate Capital Recovery Factor (CRF) = R in the disclosure doc
 # CRF = r * (1 + r)^n / ((1 + r)^n - 1)
 def calculate_crf(discount_rate, project_life):
     """Calculate Capital Recovery Factor for annualizing investment costs."""
@@ -46,12 +92,14 @@ def calculate_crf(discount_rate, project_life):
     crf = (r * (1 + r) ** n) / ((1 + r) ** n - 1)
     return crf
 
-CRF = calculate_crf(discount_rate, project_life)  # Capital Recovery Factor
+CRF = calculate_crf(discount_rate, project_life)  # R: 年均投资折算系数
+R = CRF
 
 M = 12                # Months per year
-L_bar = 0.6           # Provincial average load coefficient
-nu = 100.0             # Unit price on direct power connection (万元/km)
-D = 50.0              # Distance of direct power connection (km)                           # plot D-c_ele, D scales from 10-80 (10km stepsize)
+# \bar{L}: 110kV 及以上工商业平均负荷率（就近消纳/绿电直连容量电费公式）
+# 各省按上一年样本测算后公布；暂无公开精确值时取 0.6 作为工程常用假定
+L_bar = 0.6
+D = 50.0              # 专线距离 (km)
 
 # ============================================================
 # 5. Design Load
@@ -61,20 +109,23 @@ L = 50.0             # Maximum / designed computing load (MW)
 # ============================================================
 # 6. Energy Storage Parameters
 # ============================================================
-eta_ch  = 0.95        # Charging efficiency
-eta_dis = 0.95        # Discharging efficiency
-SOC_min = 0.1         # Minimum SOC
-SOC_max = 0.9         # Maximum SOC
-SOC_init = 0.5        # Initial SOC at t=0
-P_ST_MAX_C = 50.0     # Maximum charging power (MW)
-P_ST_MAX_D = 50.0     # Maximum discharging power (MW)
+eta_ch  = 0.95        # Charging efficiency ψ^{ST,C}
+eta_dis = 0.95        # Discharging efficiency ψ^{ST,D}
+E_init  = 0.0         # Initial stored energy E_0^{ST} = E (MWh)
+P_ST_MAX_C = 50.0     # Maximum charging power P^{ST,C,MAX} (MW)
+P_ST_MAX_D = 50.0     # Maximum discharging power P^{ST,D,MAX} (MW)
 
 # ============================================================
 # 7. Policy Parameters
 # ============================================================
-psi   = 0.2           # Max ratio of on-grid electricity to total RE generation
-phi   = 0.6           # Min RE self-consumption ratio                                              # plot phi-c_ele, phi scales from 0.1-0.9 (0.1 stepsize)
-theta = 0.3           # Min ratio of annual RE generation to annual load energy (MWh/MWh)  # plot theta-c_ele, theta scales from 0.1-0.9 (0.1 stepsize)
+# Θ: 年等效利用小时数 (h)。合成 α 将按此目标归一：Σ α_t Δ = Θ
+# 来源：宁夏典型年——光伏约 1500h、风电约 2000h（国家能源局“塞上绿电”）
+Theta_PV = 1500.0
+Theta_WT = 2000.0
+
+phi   = 0.6           # φ: 自发自用 / 可用发电量 下限 (15)；政策常用 ≥60%
+psi   = 0.05          # α: 余电上网 / 可用发电量 上限 (17)；压低以上网、促本地消纳/储能
+theta = 0.6           # β: 新能源发电量 / 用电量 下限 (16)；提高绿电占比要求
 
 
 # ============================================================
@@ -82,11 +133,38 @@ theta = 0.3           # Min ratio of annual RE generation to annual load energy 
 # ============================================================
 # Users should replace these with real data arrays of length T.
 
-def generate_synthetic_data(T):
+def _normalize_cf_to_hours(alpha, target_hours, delta):
+    """Scale capacity-factor series so Σ α·Δ = target_hours, keep α ∈ [0, 1]."""
+    alpha = np.asarray(alpha, dtype=float)
+    s = float(np.sum(alpha * delta))
+    if s <= 1e-12:
+        raise ValueError("capacity factor series sums to ~0; cannot normalize")
+    scaled = alpha * (target_hours / s)
+    # If scaling pushes above 1, clip and re-scale once on the unclipped mass if needed
+    if scaled.max() > 1.0 + 1e-12:
+        scaled = np.clip(scaled, 0.0, 1.0)
+        s2 = float(np.sum(scaled * delta))
+        if s2 < target_hours - 1e-6:
+            raise ValueError(
+                f"cannot reach {target_hours} h after clipping to [0,1] (got {s2:.1f} h); "
+                "relax shape or lower target"
+            )
+        scaled = scaled * (target_hours / s2)
+        scaled = np.clip(scaled, 0.0, 1.0)
+    return scaled
+
+
+def generate_synthetic_data(T, theta_pv=None, theta_wt=None):
     """
     Generate synthetic time-series data for testing.
-    Returns: load_t, alpha_WT_t, alpha_PV_t, mu_MKT_t
+    α_PV / α_WT shapes are synthetic, then normalized so ΣαΔ equals
+    theta_pv / theta_wt (default: module-level Theta_PV / Theta_WT).
     """
+    if theta_pv is None:
+        theta_pv = Theta_PV
+    if theta_wt is None:
+        theta_wt = Theta_WT
+
     hours = np.arange(T)
     hour_of_day = hours % 24
     day_of_year = hours // 24
@@ -100,7 +178,7 @@ def generate_synthetic_data(T):
     load_t = base_load + daily_variation + seasonal_variation
     load_t = np.clip(load_t, L * 0.5, L)
 
-    # --- Wind power output coefficient (0~1) ---
+    # --- Wind power output coefficient shape (0~1), then normalize to Θ_WT ---
     # Wind tends to be stronger at night and in winter
     wind_base = 0.2
     wind_diurnal = 0.1 * np.cos(2 * np.pi * hour_of_day / 24)
@@ -108,8 +186,9 @@ def generate_synthetic_data(T):
     wind_noise = 0.1 * np.random.RandomState(42).randn(T)
     alpha_WT_t = wind_base + wind_diurnal + wind_seasonal + wind_noise
     alpha_WT_t = np.clip(alpha_WT_t, 0.0, 1.0)
+    alpha_WT_t = _normalize_cf_to_hours(alpha_WT_t, theta_wt, delta)
 
-    # --- PV output coefficient (0~1) ---
+    # --- PV output coefficient shape (0~1), then normalize to Θ_PV ---
     # Solar follows daylight pattern, stronger in summer
     solar_envelope = np.maximum(0, np.sin(np.pi * (hour_of_day - 6) / 12))
     solar_envelope[hour_of_day < 6] = 0.0
@@ -118,18 +197,38 @@ def generate_synthetic_data(T):
     solar_noise = 0.05 * np.random.RandomState(123).rand(T)
     alpha_PV_t = solar_envelope * solar_seasonal - solar_noise
     alpha_PV_t = np.clip(alpha_PV_t, 0.0, 1.0)
+    alpha_PV_t = _normalize_cf_to_hours(alpha_PV_t, theta_pv, delta)
 
-    # --- Market electricity price (万元/MWh) ---
-    # Time-of-use pricing: peak / flat / valley
-    mu_MKT_t = np.full(T, 0.035)  # flat
+    # --- Price time series (万元/MWh) ---
+    mu_PV_t = np.full(T, mu_PV)
+    mu_WT_t = np.full(T, mu_WT)
+    mu_EB_t = np.full(T, mu_EB)  # grid purchase; can replace with TOU later
+
+    # Market / on-grid sell price μ^{ES}: peak / flat / valley
+    mu_ES_t = np.full(T, 0.035)  # flat
     peak_hours = (hour_of_day >= 8) & (hour_of_day < 12) | \
                  (hour_of_day >= 17) & (hour_of_day < 21)
     valley_hours = (hour_of_day >= 23) | (hour_of_day < 7)
-    mu_MKT_t[peak_hours] = 0.045
-    mu_MKT_t[valley_hours] = 0.025
+    mu_ES_t[peak_hours] = 0.045
+    mu_ES_t[valley_hours] = 0.025
 
-    return load_t, alpha_WT_t, alpha_PV_t, mu_MKT_t
+    return load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t
 
 
 # Generate and export
-load_t, alpha_WT_t, alpha_PV_t, mu_MKT_t = generate_synthetic_data(T)
+load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t = generate_synthetic_data(T)
+mu_MKT_t = mu_ES_t  # backward-compatible alias
+mu_EO_t = np.full(T, mu_EO)
+mu_EL_t = np.full(T, mu_EL)
+mu_EG_t = np.full(T, mu_EG)
+
+# Consistency check: Θ should match Σ α Δ after normalization
+_Theta_PV_from_alpha = float(np.sum(alpha_PV_t * delta))
+_Theta_WT_from_alpha = float(np.sum(alpha_WT_t * delta))
+print(
+    f"[params] Θ_PV={Theta_PV:.1f} h (ΣαΔ={_Theta_PV_from_alpha:.1f}), "
+    f"Θ_WT={Theta_WT:.1f} h (ΣαΔ={_Theta_WT_from_alpha:.1f})"
+)
+
+# MILP relaxation of Word's strict inequality 0 < E_{t+1}
+E_eps = 1e-4

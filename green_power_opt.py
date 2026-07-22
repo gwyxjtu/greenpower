@@ -18,7 +18,7 @@ def run_optimization(X_GD_bound, output_dir="."):
     ilp_path = os.path.join(output_dir, "model.ilp")
 
     print("="*60)
-    print(f" Green Power Microgrid Capacity Planning Model (x_GD >= {X_GD_bound} MW)")
+    print(f" Green Power Microgrid Capacity Planning Model (x_GD = {X_GD_bound} MW, fixed)")
     print(f" Output directory: {output_dir}")
     print("="*60)
     print("Building model...")
@@ -47,7 +47,7 @@ def run_optimization(X_GD_bound, output_dir="."):
     x_WT = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_WT")
     x_PV = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_PV")
     x_ST = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_ST")
-    x_GD = model.addVar(lb=X_GD_bound, vtype=GRB.CONTINUOUS, name="x_GD")
+    x_GD = model.addVar(lb=X_GD_bound, ub=X_GD_bound, vtype=GRB.CONTINUOUS, name="x_GD")
     
     # Operation variables for each time step t (0 to T-1)
     p_WT = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_WT")
@@ -55,7 +55,7 @@ def run_optimization(X_GD_bound, output_dir="."):
     p_ST_C = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_C")
     p_ST_D = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_D")
     p_GD = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD")
-    p_GD_U = model.addVars(p.T, ub=0, vtype=GRB.CONTINUOUS, name="p_GD_U")
+    p_GD_U = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD_U")  # on-grid sell, ≤ x_GD via y2
     
     # Energy variables to linearize SOC_t * x_ST (E_t = SOC_t * x_ST)
     E = model.addVars(p.T + 1, lb=0, vtype=GRB.CONTINUOUS, name="E")
@@ -66,20 +66,37 @@ def run_optimization(X_GD_bound, output_dir="."):
     y1 = model.addVars(p.T, vtype=GRB.BINARY, name="y1")  # Grid purchase state
     y2 = model.addVars(p.T, vtype=GRB.BINARY, name="y2")  # Grid sell state
     
+    # Effective storage power w = z * p (linearized bilinear product)
+    w_ST_C = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="w_ST_C")
+    w_ST_D = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="w_ST_D")
+    
     # ============================================================
-    # 2. Objective Function
+    # 2. Objective Function (disclosure doc formula (1))
+    # J = R Σ λ x
+    #   + Σ μ_t^{PV} p_t^{PV} Δ + Σ μ_t^{WT} p_t^{WT} Δ
+    #   + Σ μ_t^{EB} p_t^{GD} Δ + M (μ^{DC} x^{GD} + 730 μ^{ED} x^{GD} L̄)
+    #   + Σ (μ_t^{EO} + μ_t^{EL}) p_t^{GD} Δ + Σ μ_t^{EG} (p_t^{PV}+p_t^{WT}+p_t^{GD}) Δ
+    #   - Σ μ_t^{ES} p_t^{GD,S} Δ + R · μ^{TL} D
     # ============================================================
     print("Setting objective function...")
     
-    cost_investment = p.CRF * (p.lambda_WT * x_WT + p.lambda_PV * x_PV + p.lambda_ST * x_ST + p.lambda_GD * x_GD)
-    cost_grid_fixed = p.M * (p.mu_DC * x_GD + 730 * p.mu_ELE * x_GD * p.L_bar)
-    # cost_grid_demand = p.M * p.mu_DC * x_GD                  # Capacity/demand charge (万元/年)
-    cost_grid_energy = gp.quicksum(p.mu_BUY * p_GD[t] * p.delta for t in range(p.T))  # Energy purchase cost (万元/年)
-    # cost_grid_fixed = cost_grid_demand + cost_grid_energy
-    cost_connection = p.nu * p.D * p.CRF
-    revenue_market = gp.quicksum(p.mu_MKT_t[t] * p_GD_U[t] for t in range(p.T))
+    cost_investment = p.R * (p.lambda_WT * x_WT + p.lambda_PV * x_PV + p.lambda_ST * x_ST + p.lambda_GD * x_GD)
+    cost_re_energy = gp.quicksum(
+        (p.mu_PV_t[t] * p_PV[t] + p.mu_WT_t[t] * p_WT[t]) * p.delta for t in range(p.T)
+    )
+    cost_grid_buy = gp.quicksum(p.mu_EB_t[t] * p_GD[t] * p.delta for t in range(p.T))
+    cost_grid_fixed = p.M * (p.mu_DC * x_GD + 730 * p.mu_ED * x_GD * p.L_bar)
+    cost_grid_surcharge = gp.quicksum(
+        (p.mu_EO_t[t] + p.mu_EL_t[t]) * p_GD[t] * p.delta for t in range(p.T)
+    )
+    cost_fund_EG = gp.quicksum(
+        p.mu_EG_t[t] * (p_PV[t] + p_WT[t] + p_GD[t]) * p.delta for t in range(p.T)
+    )
+    cost_connection = p.mu_TL * p.D * p.CRF
+    revenue_market = gp.quicksum(p.mu_ES_t[t] * p_GD_U[t] * p.delta for t in range(p.T))
     
-    J = cost_investment +  cost_grid_fixed + cost_grid_energy + cost_connection - revenue_market      # append capital recovery factor
+    J = (cost_investment + cost_re_energy + cost_grid_buy + cost_grid_fixed
+         + cost_grid_surcharge + cost_fund_EG + cost_connection - revenue_market)
     
     model.setObjective(J, GRB.MINIMIZE)
     
@@ -88,11 +105,8 @@ def run_optimization(X_GD_bound, output_dir="."):
     # ============================================================
     print("Adding constraints...")
     
-    # (1) Capacity balance constraint
-    model.addConstr(x_WT + x_PV + x_ST + x_GD >= p.L, name="c_cap_balance")
-    
-    # (2) Power balance constraint
-    model.addConstrs((p_WT[t] + p_PV[t] - p_ST_C[t] + p_ST_D[t] + p_GD[t] - p_GD_U[t] == p.load_t[t] 
+    # (2) Power balance constraint (storage uses effective power w = z * p)
+    model.addConstrs((p_WT[t] + p_PV[t] - w_ST_C[t] + w_ST_D[t] + p_GD[t] - p_GD_U[t] == p.load_t[t] 
                       for t in range(p.T)), name="c_power_balance")
     
     # (3) & (4) Physical constraints of renewable energy
@@ -100,21 +114,30 @@ def run_optimization(X_GD_bound, output_dir="."):
     model.addConstrs((p_PV[t] <= p.alpha_PV_t[t] * x_PV for t in range(p.T)), name="c_pv_max")
     
     # (5) Physical constraints of energy storage system
-    # E_t = SOC_t * x_ST, so E_t bounds are SOC_min * x_ST <= E_t <= SOC_max * x_ST
-    model.addConstrs((E[t] >= p.SOC_min * x_ST for t in range(p.T + 1)), name="c_soc_min")
-    model.addConstrs((E[t] <= p.SOC_max * x_ST for t in range(p.T + 1)), name="c_soc_max")
+    # Image form:
+    #   0 < E_t + z^C p^C ψ^C Δ - z^D (p^D / ψ^D) Δ ≤ x^ST
+    #   z^C + z^D = 1,  z ∈ {0,1}
+    #   0 ≤ p^C ≤ P^{ST,C,MAX},  0 ≤ p^D ≤ P^{ST,D,MAX}
+    #   E_0 = E
+    # Bilinear z*p is linearized via effective power w = z * p.
+    model.addConstrs((w_ST_C[t] <= p.P_ST_MAX_C * z1[t] for t in range(p.T)), name="c_wC_z")
+    model.addConstrs((w_ST_C[t] <= p_ST_C[t] for t in range(p.T)), name="c_wC_p")
+    model.addConstrs((w_ST_C[t] >= p_ST_C[t] - p.P_ST_MAX_C * (1 - z1[t]) for t in range(p.T)), name="c_wC_lb")
+    model.addConstrs((w_ST_D[t] <= p.P_ST_MAX_D * z2[t] for t in range(p.T)), name="c_wD_z")
+    model.addConstrs((w_ST_D[t] <= p_ST_D[t] for t in range(p.T)), name="c_wD_p")
+    model.addConstrs((w_ST_D[t] >= p_ST_D[t] - p.P_ST_MAX_D * (1 - z2[t]) for t in range(p.T)), name="c_wD_lb")
     
-    # Optional constraints for sustainability: ensure end of year energy >= initial energy
-    model.addConstr(E[0] == p.SOC_init * x_ST, name="c_E_init")
-    model.addConstr(E[p.T] >= p.SOC_init * x_ST, name="c_E_final")
-    
-    # State of charge dynamics (transformed to Energy):
-    model.addConstrs((E[t+1] == E[t] + (p.eta_ch * p_ST_C[t] - p_ST_D[t] / p.eta_dis) * p.delta
+    # Energy dynamics + capacity: 0 < E[t+1] ≤ x_ST  (strict >0 → E_eps)
+    model.addConstrs((E[t+1] == E[t] + (p.eta_ch * w_ST_C[t] - w_ST_D[t] / p.eta_dis) * p.delta
                       for t in range(p.T)), name="c_E_trans")
+    model.addConstrs((E[t] >= p.E_eps for t in range(1, p.T + 1)), name="c_E_min")
+    model.addConstrs((E[t] <= x_ST for t in range(p.T + 1)), name="c_E_max")
     
-    # Charge / discharge maximum power and mutual exclusivity
-    model.addConstrs((p_ST_C[t] <= p.P_ST_MAX_C * z1[t] for t in range(p.T)), name="c_st_c_max")
-    model.addConstrs((p_ST_D[t] <= p.P_ST_MAX_D * z2[t] for t in range(p.T)), name="c_st_d_max")
+    model.addConstr(E[0] == p.E_init, name="c_E_init")
+    
+    # Charge / discharge power limits (independent of z) and mutual exclusivity
+    model.addConstrs((p_ST_C[t] <= p.P_ST_MAX_C for t in range(p.T)), name="c_st_c_max")
+    model.addConstrs((p_ST_D[t] <= p.P_ST_MAX_D for t in range(p.T)), name="c_st_d_max")
     model.addConstrs((z1[t] + z2[t] == 1 for t in range(p.T)), name="c_st_mut_excl")
     
     # (6) Physical constraints of power grid
@@ -129,11 +152,14 @@ def run_optimization(X_GD_bound, output_dir="."):
     
     sum_gd_u = gp.quicksum(p_GD_U[t] * p.delta for t in range(p.T))
     sum_re = gp.quicksum((p_WT[t] + p_PV[t]) * p.delta for t in range(p.T))
+    # Available annual RE energy: x^{PV} Θ^{PV} + x^{WT} Θ^{WT}  (Word (15)(17))
+    avail_re = x_PV * p.Theta_PV + x_WT * p.Theta_WT
     
-    model.addConstr(sum_gd_u <= p.psi * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_grid_prop")
+    # (17) on-grid ratio ≤ α (psi)
+    model.addConstr(sum_gd_u <= p.psi * avail_re, name="c_grid_prop")
     
-    # (7) Renewable energy generation constraints
-    model.addConstr(sum_re - sum_gd_u >= p.phi * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_re_prop1")
+    # (15) self-consumption ratio ≥ φ (phi); (16) RE/load ≥ β (theta)
+    model.addConstr(sum_re - sum_gd_u >= p.phi * avail_re, name="c_re_prop1")
     sum_load = gp.quicksum(p.load_t[t] * p.delta for t in range(p.T))
     model.addConstr(sum_re >= p.theta * sum_load, name="c_re_prop2")
     
@@ -163,10 +189,15 @@ def run_optimization(X_GD_bound, output_dir="."):
             # Real (un-annualized) cost breakdown
             N = p.project_life  # project lifetime in years
             c_inv = p.lambda_WT * x_WT.X + p.lambda_PV * x_PV.X + p.lambda_ST * x_ST.X + p.lambda_GD * x_GD.X
-            c_conn = p.nu * p.D
-            c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ELE * x_GD.X * p.L_bar)
-            c_grid_energy = sum(p.mu_BUY * p_GD[t].X * p.delta for t in range(p.T))
-            rev_mkt = sum(p.mu_MKT_t[t] * p_GD_U[t].X for t in range(p.T))
+            c_conn = p.mu_TL * p.D
+            c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ED * x_GD.X * p.L_bar)
+            c_grid_energy = sum(
+                (p.mu_EB_t[t] + p.mu_EO_t[t] + p.mu_EL_t[t]) * p_GD[t].X * p.delta
+                + p.mu_EG_t[t] * (p_PV[t].X + p_WT[t].X + p_GD[t].X) * p.delta
+                + (p.mu_PV_t[t] * p_PV[t].X + p.mu_WT_t[t] * p_WT[t].X) * p.delta
+                for t in range(p.T)
+            )
+            rev_mkt = sum(p.mu_ES_t[t] * p_GD_U[t].X * p.delta for t in range(p.T))
             total_load = sum(p.load_t[t] for t in range(p.T))
             # LCOE = lifetime total net cost / lifetime total energy
             # c_inv & c_conn are one-time; c_grid & rev_mkt are annual; ×10 converts 万元/MWh -> 元/kWh
@@ -176,20 +207,32 @@ def run_optimization(X_GD_bound, output_dir="."):
             f.write(f" - Equipment Investment (one-time): {c_inv:.2f} 万元\n")
             f.write(f" - Direct Connection Cost (one-time): {c_conn:.2f} 万元\n")
             f.write(f" - Annual Grid Demand Charge: {c_grid:.2f} 万元/年\n")
-            f.write(f" - Annual Grid Energy Cost: {c_grid_energy:.2f} 万元/年\n")
+            f.write(f" - Annual Energy/Tariff Cost (EB+EO+EL+EG+RE): {c_grid_energy:.2f} 万元/年\n")
             f.write(f" - Annual Grid Charge (total): {c_grid + c_grid_energy:.2f} 万元/年\n")
             f.write(f" - Annual Market Revenue: {rev_mkt:.2f} 万元/年\n")
             f.write(f" - Unit Electricity Cost (LCOE, {N}-yr lifecycle): {c_ele:.4f} 元/kWh\n")
-            sum_re_res = [p_PV[t].x + p_WT[t].x for t in range(p.T)]
-            sum_gd_u_res = [p_GD_U[t].x for t in range(p.T)]
-            phi_val = (sum(sum_re_res) - sum(sum_gd_u_res)) / gp.quicksum((p.alpha_WT_t[t] * x_WT.x + p.alpha_PV_t[t] * x_PV.x) * p.delta for t in range(p.T))
-            f.write(f" - phi: {phi_val:}\n")
             
             total_re = sum((p_WT[t].X + p_PV[t].X) * p.delta for t in range(p.T))
-            total_load = sum(p.load_t[t] for t in range(p.T))
+            total_gd_u = sum(p_GD_U[t].X * p.delta for t in range(p.T))
+            total_load_e = sum(p.load_t[t] * p.delta for t in range(p.T))
+            avail_re_val = x_PV.X * p.Theta_PV + x_WT.X * p.Theta_WT
+            # (17) 余电上网比例 α = Σ p^{GD,S} Δ / (x^{PV} Θ^{PV} + x^{WT} Θ^{WT})
+            ratio_export = total_gd_u / avail_re_val if avail_re_val > 1e-9 else 0.0
+            # (15) 自发自用比例 φ = Σ (p^{PV}+p^{WT}-p^{GD,S}) Δ / avail_re
+            ratio_self = (total_re - total_gd_u) / avail_re_val if avail_re_val > 1e-9 else 0.0
+            # (16) 绿电使用占比 β = Σ (p^{PV}+p^{WT}) Δ / Σ L_t Δ
+            ratio_re_load = total_re / total_load_e if total_load_e > 1e-9 else 0.0
+            
+            f.write("\n [Policy Ratios] \n")
+            f.write(f" - 余电上网比例 (sum_gd_u/avail_re): {ratio_export:.4f}\n")
+            f.write(f" - 自发自用比例 ((sum_re-sum_gd_u)/avail_re): {ratio_self:.4f}\n")
+            f.write(f" - 绿电使用占比 (sum_re/sum_load): {ratio_re_load:.4f}\n")
+            
             f.write("\n [Energy Statistics] \n")
             f.write(f" - Total Renewable Generation: {total_re:.2f} MWh\n")
-            f.write(f" - Total Load Demand: {total_load:.2f} MWh\n")
+            f.write(f" - Total Load Demand: {total_load_e:.2f} MWh\n")
+            f.write(f" - Available RE (x*Θ): {avail_re_val:.2f} MWh\n")
+            f.write(f" - On-grid Export (sum_gd_u): {total_gd_u:.2f} MWh\n")
         
         print(f"Optimization successful! Results saved to '{results_path}'.")
         
@@ -206,8 +249,8 @@ def run_optimization(X_GD_bound, output_dir="."):
                     round(p.load_t[t], 2),
                     round(p_WT[t].X, 2),
                     round(p_PV[t].X, 2),
-                    round(p_ST_C[t].X, 2),
-                    round(p_ST_D[t].X, 2),
+                    round(w_ST_C[t].X, 2),
+                    round(w_ST_D[t].X, 2),
                     round(soc_val, 4),
                     round(p_GD[t].X, 2),
                     round(p_GD_U[t].X, 2)
@@ -619,7 +662,7 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         p_ST_C = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_C")
         p_ST_D = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_D")
         p_GD = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD")
-        p_GD_U = model.addVars(p.T, lb=0,ub=0, vtype=GRB.CONTINUOUS, name="p_GD_U")
+        p_GD_U = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD_U")  # on-grid sell, ≤ x_GD via y2
         
         E = model.addVars(p.T + 1, lb=0, vtype=GRB.CONTINUOUS, name="E")
         
@@ -628,35 +671,53 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         y1 = model.addVars(p.T, vtype=GRB.BINARY, name="y1")
         y2 = model.addVars(p.T, vtype=GRB.BINARY, name="y2")
         
-        # Objective
-        cost_investment = p.CRF * (p.lambda_WT * x_WT + p.lambda_PV * x_PV + p.lambda_ST * x_ST + p.lambda_GD * x_GD)
-        cost_grid_fixed = p.M * (p.mu_DC * x_GD + 730 * p.mu_ELE * x_GD * p.L_bar)
-        cost_grid_energy = gp.quicksum(p.mu_BUY * p_GD[t] * p.delta for t in range(p.T))  # Energy purchase cost (万元/年)
-        cost_connection = p.nu * D_val * p.CRF
-        revenue_market = gp.quicksum(p.mu_MKT_t[t] * p_GD_U[t] for t in range(p.T))
+        # Effective storage power w = z * p
+        w_ST_C = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="w_ST_C")
+        w_ST_D = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="w_ST_D")
         
-        J = cost_investment + cost_grid_fixed + cost_grid_energy + cost_connection - revenue_market
+        # Objective (disclosure doc formula (1))
+        cost_investment = p.R * (p.lambda_WT * x_WT + p.lambda_PV * x_PV + p.lambda_ST * x_ST + p.lambda_GD * x_GD)
+        cost_re_energy = gp.quicksum(
+            (p.mu_PV_t[t] * p_PV[t] + p.mu_WT_t[t] * p_WT[t]) * p.delta for t in range(p.T)
+        )
+        cost_grid_buy = gp.quicksum(p.mu_EB_t[t] * p_GD[t] * p.delta for t in range(p.T))
+        cost_grid_fixed = p.M * (p.mu_DC * x_GD + 730 * p.mu_ED * x_GD * p.L_bar)
+        cost_grid_surcharge = gp.quicksum(
+            (p.mu_EO_t[t] + p.mu_EL_t[t]) * p_GD[t] * p.delta for t in range(p.T)
+        )
+        cost_fund_EG = gp.quicksum(
+            p.mu_EG_t[t] * (p_PV[t] + p_WT[t] + p_GD[t]) * p.delta for t in range(p.T)
+        )
+        cost_connection = p.mu_TL * D_val * p.CRF
+        revenue_market = gp.quicksum(p.mu_ES_t[t] * p_GD_U[t] * p.delta for t in range(p.T))
+        
+        J = (cost_investment + cost_re_energy + cost_grid_buy + cost_grid_fixed
+             + cost_grid_surcharge + cost_fund_EG + cost_connection - revenue_market)
         model.setObjective(J, GRB.MINIMIZE)
         
         # Constraints
-        model.addConstr(x_WT + x_PV + x_ST + x_GD >= p.L, name="c_cap_balance")
-        model.addConstrs((p_WT[t] + p_PV[t] - p_ST_C[t] + p_ST_D[t] + p_GD[t] - p_GD_U[t] == p.load_t[t] 
+        model.addConstrs((p_WT[t] + p_PV[t] - w_ST_C[t] + w_ST_D[t] + p_GD[t] - p_GD_U[t] == p.load_t[t] 
                           for t in range(p.T)), name="c_power_balance")
         
         model.addConstrs((p_WT[t] <= p.alpha_WT_t[t] * x_WT for t in range(p.T)), name="c_wt_max")
         model.addConstrs((p_PV[t] <= p.alpha_PV_t[t] * x_PV for t in range(p.T)), name="c_pv_max")
         
-        model.addConstrs((E[t] >= p.SOC_min * x_ST for t in range(p.T + 1)), name="c_soc_min")
-        model.addConstrs((E[t] <= p.SOC_max * x_ST for t in range(p.T + 1)), name="c_soc_max")
+        # Storage: image formulation with linearized w = z * p
+        model.addConstrs((w_ST_C[t] <= p.P_ST_MAX_C * z1[t] for t in range(p.T)), name="c_wC_z")
+        model.addConstrs((w_ST_C[t] <= p_ST_C[t] for t in range(p.T)), name="c_wC_p")
+        model.addConstrs((w_ST_C[t] >= p_ST_C[t] - p.P_ST_MAX_C * (1 - z1[t]) for t in range(p.T)), name="c_wC_lb")
+        model.addConstrs((w_ST_D[t] <= p.P_ST_MAX_D * z2[t] for t in range(p.T)), name="c_wD_z")
+        model.addConstrs((w_ST_D[t] <= p_ST_D[t] for t in range(p.T)), name="c_wD_p")
+        model.addConstrs((w_ST_D[t] >= p_ST_D[t] - p.P_ST_MAX_D * (1 - z2[t]) for t in range(p.T)), name="c_wD_lb")
         
-        model.addConstr(E[0] == p.SOC_init * x_ST, name="c_E_init")
-        model.addConstr(E[p.T] >= p.SOC_init * x_ST, name="c_E_final")
-        
-        model.addConstrs((E[t+1] == E[t] + (p.eta_ch * p_ST_C[t] - p_ST_D[t] / p.eta_dis) * p.delta
+        model.addConstrs((E[t+1] == E[t] + (p.eta_ch * w_ST_C[t] - w_ST_D[t] / p.eta_dis) * p.delta
                           for t in range(p.T)), name="c_E_trans")
+        model.addConstrs((E[t] >= p.E_eps for t in range(1, p.T + 1)), name="c_E_min")
+        model.addConstrs((E[t] <= x_ST for t in range(p.T + 1)), name="c_E_max")
+        model.addConstr(E[0] == p.E_init, name="c_E_init")
         
-        model.addConstrs((p_ST_C[t] <= p.P_ST_MAX_C * z1[t] for t in range(p.T)), name="c_st_c_max")
-        model.addConstrs((p_ST_D[t] <= p.P_ST_MAX_D * z2[t] for t in range(p.T)), name="c_st_d_max")
+        model.addConstrs((p_ST_C[t] <= p.P_ST_MAX_C for t in range(p.T)), name="c_st_c_max")
+        model.addConstrs((p_ST_D[t] <= p.P_ST_MAX_D for t in range(p.T)), name="c_st_d_max")
         model.addConstrs((z1[t] + z2[t] == 1 for t in range(p.T)), name="c_st_mut_excl")
         
         model.addConstrs((p_GD[t] <= x_GD * y1[t] for t in range(p.T)), name="c_gd_buy_max")
@@ -665,11 +726,12 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         
         sum_gd_u = gp.quicksum(p_GD_U[t] * p.delta for t in range(p.T))
         sum_re = gp.quicksum((p_WT[t] + p_PV[t]) * p.delta for t in range(p.T))
+        avail_re = x_PV * p.Theta_PV + x_WT * p.Theta_WT
         
-        model.addConstr(sum_gd_u <= p.psi * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_grid_prop")
-        model.addConstr(sum_re - sum_gd_u == phi_val * gp.quicksum((p.alpha_WT_t[t] * x_WT + p.alpha_PV_t[t] * x_PV) * p.delta for t in range(p.T)), name="c_re_prop1")
+        model.addConstr(sum_gd_u <= p.psi * avail_re, name="c_grid_prop")
+        model.addConstr(sum_re - sum_gd_u == phi_val * avail_re, name="c_re_prop1")
         sum_load = gp.quicksum(p.load_t[t] * p.delta for t in range(p.T))
-        model.addConstr(sum_re == theta_val * sum_load, name="c_re_prop2")
+        model.addConstr(sum_re >= theta_val * sum_load, name="c_re_prop2")
         
         # Optimize
         model.optimize()
@@ -679,10 +741,15 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
             # Real (un-annualized) cost breakdown
             N = p.project_life  # project lifetime in years
             c_inv = p.lambda_WT * x_WT.X + p.lambda_PV * x_PV.X + p.lambda_ST * x_ST.X + p.lambda_GD * x_GD.X
-            c_conn = p.nu * D_val
-            c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ELE * x_GD.X * p.L_bar)
-            c_grid_energy = sum(p.mu_BUY * p_GD[t].X * p.delta for t in range(p.T))
-            rev_mkt = sum(p.mu_MKT_t[t] * p_GD_U[t].X for t in range(p.T))
+            c_conn = p.mu_TL * D_val
+            c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ED * x_GD.X * p.L_bar)
+            c_grid_energy = sum(
+                (p.mu_EB_t[t] + p.mu_EO_t[t] + p.mu_EL_t[t]) * p_GD[t].X * p.delta
+                + p.mu_EG_t[t] * (p_PV[t].X + p_WT[t].X + p_GD[t].X) * p.delta
+                + (p.mu_PV_t[t] * p_PV[t].X + p.mu_WT_t[t] * p_WT[t].X) * p.delta
+                for t in range(p.T)
+            )
+            rev_mkt = sum(p.mu_ES_t[t] * p_GD_U[t].X * p.delta for t in range(p.T))
             total_load = sum(p.load_t[t] for t in range(p.T))
             # LCOE = lifetime total net cost / lifetime total energy; ×10 converts 万元/MWh -> 元/kWh
             c_ele = ((c_inv + c_conn) + N * (c_grid + c_grid_energy - rev_mkt)) / (N * total_load) * 10 if total_load > 0 else 0
@@ -703,8 +770,8 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
                     x_GD=x_GD,
                     p_WT=p_WT,
                     p_PV=p_PV,
-                    p_ST_C=p_ST_C,
-                    p_ST_D=p_ST_D,
+                    p_ST_C=w_ST_C,
+                    p_ST_D=w_ST_D,
                     p_GD=p_GD,
                     p_GD_U=p_GD_U,
                     E=E,
@@ -771,5 +838,5 @@ if __name__ == "__main__":
     # else:
     #     for X_GD_bound in X_GD_bounds:
     #         _run_optimization_job(X_GD_bound)
-    # run_optimization(60)
-    run_sensitivity_analysis()
+    # run_sensitivity_analysis()
+    run_optimization(50, output_dir="results/x_gd_50")
