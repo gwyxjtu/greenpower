@@ -6,6 +6,7 @@ Time-series data (load, wind/PV coefficients, electricity prices)
 are generated as synthetic placeholders. Replace with real data.
 """
 
+import os
 import numpy as np
 
 
@@ -20,7 +21,7 @@ delta = 1.0       # Duration of each time step (hours)
 # 2. Equipment Unit Prices (万元/MW or 万元/MWh)
 # ============================================================
 lambda_WT = 800.0     # Wind turbine unit price (万元/MW)
-lambda_PV = 400.0     # PV panel unit price (万元/MW)
+lambda_PV = 300.0     # PV panel unit price (万元/MW)
 lambda_ST = 80.0      # Energy storage unit price (万元/MWh)
 lambda_GD = 12.0      # Grid transformer unit price (万元/MW)
 
@@ -44,12 +45,12 @@ mu_ED = 0.0060        # 万元/MWh  (= 0.060 元/kWh)
 # μ^{EO}: 系统运行费折价（辅助服务、煤电/抽蓄容量电费等分摊，月度浮动）
 # 东部省份常见约 0.02–0.04 元/kWh；西部相对偏低，取中位偏低
 # 参考：各省电网企业代理购电月度公告（如皖/苏约 0.02–0.038）
-mu_EO = 0.0015        # 万元/MWh  (= 0.015 元/kWh)
+mu_EO = 0.0039        # 万元/MWh  (= 0.039 元/kWh)
 
 # μ^{EL}: 上网环节线损电价 ≈ 上网电价 × 综合线损率
 # 宁夏综合线损率 2.59%（第三监管周期）；取购电价≈0.35 元/kWh → ≈0.009 元/kWh
 # 来源：宁夏输配电价表注（线损率 2.59%）
-mu_EL = 0.0009        # 万元/MWh  (= 0.009 元/kWh)
+mu_EL = 0.00071        # 万元/MWh  (= 0.009 元/kWh)
 
 # μ^{EG}: 政府性基金及附加
 # 宁夏：重大水利 0.1125 分 + 移民扶持 0.12 分 + 可再生附加 1.9 分 ≈ 0.0213 元/kWh
@@ -58,7 +59,7 @@ mu_EG = 0.00213       # 万元/MWh  (= 0.0213 元/kWh)
 
 # μ^{EB}: 电力市场/代理购电电能量价格（不含输配、基金等，后者已分项）
 # 西部代理购电常见约 0.30–0.40 元/kWh，取 0.35
-mu_EB = 0.035         # 万元/MWh  (= 0.35 元/kWh)
+mu_EB = 0.05          # 万元/MWh  (= 0.5 元/kWh)
 
 # μ^{PV}/μ^{WT}: 风光自发自用内部转移价，按电力市场 PPA/长协（机制电价）参考
 # 宁夏 2025–2026 新能源机制电价竞价出清 0.2595 元/kWh（=燃煤标杆上限）
@@ -121,11 +122,11 @@ P_ST_MAX_D = 50.0     # Maximum discharging power P^{ST,D,MAX} (MW)
 # Θ: 年等效利用小时数 (h)。合成 α 将按此目标归一：Σ α_t Δ = Θ
 # 来源：宁夏典型年——光伏约 1500h、风电约 2000h（国家能源局“塞上绿电”）
 Theta_PV = 1500.0
-Theta_WT = 2000.0
+Theta_WT = 1800.0
 
 phi   = 0.6           # φ: 自发自用 / 可用发电量 下限 (15)；政策常用 ≥60%
-psi   = 0.05          # α: 余电上网 / 可用发电量 上限 (17)；压低以上网、促本地消纳/储能
-theta = 0.6           # β: 新能源发电量 / 用电量 下限 (16)；提高绿电占比要求
+psi   = 0.20          # α: 余电上网 / 可用发电量 上限 (17)
+theta = 0.30          # β: 新能源发电量 / 用电量 下限 (16)
 
 
 # ============================================================
@@ -154,23 +155,27 @@ def _normalize_cf_to_hours(alpha, target_hours, delta):
     return scaled
 
 
-def generate_synthetic_data(T, theta_pv=None, theta_wt=None):
-    """
-    Generate synthetic time-series data for testing.
-    α_PV / α_WT shapes are synthetic, then normalized so ΣαΔ equals
-    theta_pv / theta_wt (default: module-level Theta_PV / Theta_WT).
-    """
-    if theta_pv is None:
-        theta_pv = Theta_PV
-    if theta_wt is None:
-        theta_wt = Theta_WT
+def _wind_power_curve(v):
+    """Simplified wind power curve: v→capacity factor (0–1)."""
+    v_cut_in, v_rated, v_cut_out = 3.0, 12.0, 25.0
+    v = np.asarray(v, dtype=float)
+    cf = np.zeros_like(v)
+    mid = (v >= v_cut_in) & (v < v_rated)
+    cf[mid] = ((v[mid] - v_cut_in) / (v_rated - v_cut_in)) ** 3
+    cf[(v >= v_rated) & (v <= v_cut_out)] = 1.0
+    return cf
 
+
+def generate_synthetic_data(T):
+    """
+    Load real PV/WT coefficients from data/pvwatts_hourly.csv (Yinchuan).
+    Returns raw α series and actual Θ values computed from data.
+    """
     hours = np.arange(T)
     hour_of_day = hours % 24
     day_of_year = hours // 24
 
     # --- Load profile (MW) ---
-    # Base load + daily pattern (higher during daytime)
     base_load = L * 0.7
     daily_variation = L * 0.2 * np.sin(np.pi * (hour_of_day - 6) / 16)
     daily_variation = np.clip(daily_variation, 0, None)
@@ -178,31 +183,37 @@ def generate_synthetic_data(T, theta_pv=None, theta_wt=None):
     load_t = base_load + daily_variation + seasonal_variation
     load_t = np.clip(load_t, L * 0.5, L)
 
-    # --- Wind power output coefficient shape (0~1), then normalize to Θ_WT ---
-    # Wind tends to be stronger at night and in winter
-    wind_base = 0.2
-    wind_diurnal = 0.1 * np.cos(2 * np.pi * hour_of_day / 24)
-    wind_seasonal = 0.1 * np.cos(2 * np.pi * day_of_year / 365)
-    wind_noise = 0.1 * np.random.RandomState(42).randn(T)
-    alpha_WT_t = wind_base + wind_diurnal + wind_seasonal + wind_noise
-    alpha_WT_t = np.clip(alpha_WT_t, 0.0, 1.0)
-    alpha_WT_t = _normalize_cf_to_hours(alpha_WT_t, theta_wt, delta)
+    # --- Real PV and wind data from PVWatts CSV (Yinchuan) ---
+    csv_path = os.path.join(os.path.dirname(__file__), "data", "pvwatts_hourly.csv")
+    import csv
+    with open(csv_path, "r", encoding="utf-8") as f:
+        for _ in range(32):
+            next(f)
+        reader = csv.reader(f)
+        rows = []
+        for row in reader:
+            if not row:
+                continue
+            rows.append([float(v) for v in row])
+    raw = np.array(rows)
+    wind_speed = raw[:, 6]
+    ac_output = raw[:, 11]
 
-    # --- PV output coefficient shape (0~1), then normalize to Θ_PV ---
-    # Solar follows daylight pattern, stronger in summer
-    solar_envelope = np.maximum(0, np.sin(np.pi * (hour_of_day - 6) / 12))
-    solar_envelope[hour_of_day < 6] = 0.0
-    solar_envelope[hour_of_day >= 18] = 0.0
-    solar_seasonal = 0.8 + 0.2 * np.sin(2 * np.pi * (day_of_year - 80) / 365)
-    solar_noise = 0.05 * np.random.RandomState(123).rand(T)
-    alpha_PV_t = solar_envelope * solar_seasonal - solar_noise
+    # PV capacity factor: AC output per 1 kW DC → MW/MW (0–1), raw, no normalization
+    alpha_PV_t = ac_output / 1000.0
     alpha_PV_t = np.clip(alpha_PV_t, 0.0, 1.0)
-    alpha_PV_t = _normalize_cf_to_hours(alpha_PV_t, theta_pv, delta)
+
+    # Wind capacity factor from wind speed via power curve, raw
+    alpha_WT_t = _wind_power_curve(wind_speed)
+
+    # Actual Θ from data (used in policy constraints)
+    theta_pv_actual = float(np.sum(alpha_PV_t * delta))
+    theta_wt_actual = float(np.sum(alpha_WT_t * delta))
 
     # --- Price time series (万元/MWh) ---
     mu_PV_t = np.full(T, mu_PV)
     mu_WT_t = np.full(T, mu_WT)
-    mu_EB_t = np.full(T, mu_EB)  # grid purchase; can replace with TOU later
+    mu_EB_t = np.full(T, mu_EB)
 
     # Market / on-grid sell price μ^{ES}: peak / flat / valley
     mu_ES_t = np.full(T, 0.035)  # flat
@@ -212,11 +223,14 @@ def generate_synthetic_data(T, theta_pv=None, theta_wt=None):
     mu_ES_t[peak_hours] = 0.045
     mu_ES_t[valley_hours] = 0.025
 
-    return load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t
+    return load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t, theta_pv_actual, theta_wt_actual
 
 
-# Generate and export
-load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t = generate_synthetic_data(T)
+# Generate and export — use actual Θ from real data
+load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t, _theta_pv, _theta_wt = generate_synthetic_data(T)
+# Override Θ with real data values (so policy constraints match actual α series)
+Theta_PV = _theta_pv
+Theta_WT = _theta_wt
 mu_MKT_t = mu_ES_t  # backward-compatible alias
 mu_EO_t = np.full(T, mu_EO)
 mu_EL_t = np.full(T, mu_EL)
@@ -226,8 +240,8 @@ mu_EG_t = np.full(T, mu_EG)
 _Theta_PV_from_alpha = float(np.sum(alpha_PV_t * delta))
 _Theta_WT_from_alpha = float(np.sum(alpha_WT_t * delta))
 print(
-    f"[params] Θ_PV={Theta_PV:.1f} h (ΣαΔ={_Theta_PV_from_alpha:.1f}), "
-    f"Θ_WT={Theta_WT:.1f} h (ΣαΔ={_Theta_WT_from_alpha:.1f})"
+    f"[params] Θ_PV={Theta_PV:.1f} h (from PVWatts AC output), "
+    f"Θ_WT={Theta_WT:.1f} h (from wind speed→power curve)"
 )
 
 # MILP relaxation of Word's strict inequality 0 < E_{t+1}

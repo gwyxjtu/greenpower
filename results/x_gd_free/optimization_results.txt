@@ -1,0 +1,29 @@
+============================================================
+ Optimization Terminated! Status: OPTIMAL
+ Total Annualized Objective: 22065.59 万元/年
+============================================================
+ [Optimal Capacities] 
+ - Wind Power (x_WT): 0.00 MW
+ - Photovoltaic (x_PV): 82.10 MW
+ - Energy Storage (x_ST): 38.17 MWh
+ - Grid Transformer (x_GD): 37.97 MW
+
+ [Cost Breakdown - Real Prices] 
+ - Equipment Investment (one-time): 28138.17 万元
+ - Direct Connection Cost (one-time): 5000.00 万元
+ - Annual Grid Demand Charge: 2364.07 万元/年
+ - Annual Energy/Tariff Cost (EB+EO+EL+EG+RE): 16001.45 万元/年
+ - Annual Grid Charge (total): 18365.51 万元/年
+ - Annual Market Revenue: 171.44 万元/年
+ - Unit Electricity Cost (LCOE, 15-yr lifecycle): 0.5937 元/kWh
+
+ [Policy Ratios] 
+ - 余电上网比例 (sum_gd_u/avail_re): 0.0307
+ - 自发自用比例 ((sum_re-sum_gd_u)/avail_re): 0.9693
+ - 绿电使用占比 (sum_re/sum_load): 0.3842
+
+ [Energy Statistics] 
+ - Total Renewable Generation: 132021.93 MWh
+ - Total Load Demand: 343659.07 MWh
+ - Available RE (x*Θ): 132021.93 MWh
+ - On-grid Export (sum_gd_u): 4052.31 MWh

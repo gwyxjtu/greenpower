@@ -18,7 +18,7 @@ def run_optimization(X_GD_bound, output_dir="."):
     ilp_path = os.path.join(output_dir, "model.ilp")
 
     print("="*60)
-    print(f" Green Power Microgrid Capacity Planning Model (x_GD = {X_GD_bound} MW, fixed)")
+    print(f" Green Power Microgrid Capacity Planning Model (x_GD free decision)")
     print(f" Output directory: {output_dir}")
     print("="*60)
     print("Building model...")
@@ -47,7 +47,7 @@ def run_optimization(X_GD_bound, output_dir="."):
     x_WT = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_WT")
     x_PV = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_PV")
     x_ST = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_ST")
-    x_GD = model.addVar(lb=X_GD_bound, ub=X_GD_bound, vtype=GRB.CONTINUOUS, name="x_GD")
+    x_GD = model.addVar(lb=0, ub=200, vtype=GRB.CONTINUOUS, name="x_GD")
     
     # Operation variables for each time step t (0 to T-1)
     p_WT = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_WT")
@@ -839,4 +839,4 @@ if __name__ == "__main__":
     #     for X_GD_bound in X_GD_bounds:
     #         _run_optimization_job(X_GD_bound)
     # run_sensitivity_analysis()
-    run_optimization(50, output_dir="results/x_gd_50")
+    run_optimization(0, output_dir="results/x_gd_free")
