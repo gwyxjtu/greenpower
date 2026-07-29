@@ -20,7 +20,7 @@ delta = 1.0       # Duration of each time step (hours)
 # ============================================================
 # 2. Equipment Unit Prices (万元/MW or 万元/MWh)
 # ============================================================
-lambda_WT = 800.0     # Wind turbine unit price (万元/MW)
+lambda_WT = 410.0     # Wind turbine unit price (万元/MW) = 4100 元/kW (水电总院2025全国均价)
 lambda_PV = 300.0     # PV panel unit price (万元/MW)
 lambda_ST = 80.0      # Energy storage unit price (万元/MWh)
 lambda_GD = 12.0      # Grid transformer unit price (万元/MW)
@@ -103,9 +103,15 @@ L_bar = 0.6
 D = 50.0              # 专线距离 (km)
 
 # ============================================================
-# 5. Design Load
+# 5. Design Load & PV Land-Use Limit
 # ============================================================
 L = 50.0             # Maximum / designed computing load (MW)
+
+# A(x^{PV}) ≤ S^{PV,MAX}: 占地面积约束
+# 估算：1.1 MW ≈ 12 亩 → a_PV = 12/1.1 亩/MW
+# 项目可用光伏用地最大 1 km² = 1500 亩 → x_PV ≤ 1500 × 1.1/12 = 137.5 MW
+a_PV = 12.0 / 1.1    # 亩/MW
+S_PV_MAX = 1500.0    # 亩 (= 1 km²)
 
 # ============================================================
 # 6. Energy Storage Parameters
@@ -166,10 +172,49 @@ def _wind_power_curve(v):
     return cf
 
 
+def _hub_height_wind(v_ref, h_ref=10.0, h_hub=100.0, shear_exp=0.14):
+    """Extrapolate near-surface wind to hub height (power-law shear)."""
+    return np.asarray(v_ref, dtype=float) * (h_hub / h_ref) ** shear_exp
+
+
+def _calibrate_wind_cf(v_hub, target_hours, delta=1.0):
+    """
+    Scale hub-height wind so annual equivalent hours ≈ target_hours.
+    Preserves the temporal shape; only adjusts overall intensity.
+    Ningxia onshore wind farms typically ~1800–2000 h (mean hub wind ~6–7 m/s).
+    """
+    v_hub = np.asarray(v_hub, dtype=float)
+
+    def hours_at(scale):
+        return float(np.sum(_wind_power_curve(v_hub * scale) * delta))
+
+    # If already at/above target with scale=1, just use raw (optionally soft-normalize)
+    h0 = hours_at(1.0)
+    if h0 >= target_hours - 1e-6:
+        return _normalize_cf_to_hours(_wind_power_curve(v_hub), target_hours, delta), 1.0, h0
+
+    # Binary search speed scale so Θ ≈ target
+    lo, hi = 1.0, 4.0
+    if hours_at(hi) < target_hours:
+        raise ValueError(
+            f"cannot reach Θ_WT={target_hours} h even at {hi}× hub wind "
+            f"(got {hours_at(hi):.0f} h; mean hub wind={v_hub.mean():.2f} m/s)"
+        )
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if hours_at(mid) < target_hours:
+            lo = mid
+        else:
+            hi = mid
+    scale = 0.5 * (lo + hi)
+    cf = _wind_power_curve(v_hub * scale)
+    return cf, scale, hours_at(scale)
+
+
 def generate_synthetic_data(T):
     """
-    Load real PV/WT coefficients from data/pvwatts_hourly.csv (Yinchuan).
-    Returns raw α series and actual Θ values computed from data.
+    Load PV from data/pvwatts_hourly.csv (Yinchuan AC output).
+    Wind: same file's near-surface wind → hub-height shear → calibrate to Θ_WT.
     """
     hours = np.arange(T)
     hour_of_day = hours % 24
@@ -196,17 +241,18 @@ def generate_synthetic_data(T):
                 continue
             rows.append([float(v) for v in row])
     raw = np.array(rows)
-    wind_speed = raw[:, 6]
+    wind_speed_10m = raw[:, 6]
     ac_output = raw[:, 11]
 
-    # PV capacity factor: AC output per 1 kW DC → MW/MW (0–1), raw, no normalization
-    alpha_PV_t = ac_output / 1000.0
-    alpha_PV_t = np.clip(alpha_PV_t, 0.0, 1.0)
+    # PV capacity factor: AC output per 1 kW DC → MW/MW (0–1)
+    alpha_PV_t = np.clip(ac_output / 1000.0, 0.0, 1.0)
 
-    # Wind capacity factor from wind speed via power curve, raw
-    alpha_WT_t = _wind_power_curve(wind_speed)
+    # Wind: 10 m AGL (PVWatts) is far too weak for utility turbines.
+    # Extrapolate to 100 m hub height, then calibrate intensity to Θ_WT (宁夏典型 ~1800 h).
+    v_hub = _hub_height_wind(wind_speed_10m, h_ref=10.0, h_hub=100.0, shear_exp=0.14)
+    alpha_WT_t, wind_scale, theta_wt_raw = _calibrate_wind_cf(v_hub, Theta_WT, delta)
+    alpha_WT_t = np.clip(alpha_WT_t, 0.0, 1.0)
 
-    # Actual Θ from data (used in policy constraints)
     theta_pv_actual = float(np.sum(alpha_PV_t * delta))
     theta_wt_actual = float(np.sum(alpha_WT_t * delta))
 
@@ -223,12 +269,18 @@ def generate_synthetic_data(T):
     mu_ES_t[peak_hours] = 0.045
     mu_ES_t[valley_hours] = 0.025
 
-    return load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t, theta_pv_actual, theta_wt_actual
+    return (
+        load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t,
+        theta_pv_actual, theta_wt_actual, float(v_hub.mean()), wind_scale,
+    )
 
 
-# Generate and export — use actual Θ from real data
-load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t, _theta_pv, _theta_wt = generate_synthetic_data(T)
-# Override Θ with real data values (so policy constraints match actual α series)
+# Generate and export
+(
+    load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t,
+    _theta_pv, _theta_wt, _v_hub_mean, _wind_scale,
+) = generate_synthetic_data(T)
+# PV Θ from measured AC; WT Θ from calibrated series (≈ target Theta_WT)
 Theta_PV = _theta_pv
 Theta_WT = _theta_wt
 mu_MKT_t = mu_ES_t  # backward-compatible alias
@@ -236,12 +288,10 @@ mu_EO_t = np.full(T, mu_EO)
 mu_EL_t = np.full(T, mu_EL)
 mu_EG_t = np.full(T, mu_EG)
 
-# Consistency check: Θ should match Σ α Δ after normalization
-_Theta_PV_from_alpha = float(np.sum(alpha_PV_t * delta))
-_Theta_WT_from_alpha = float(np.sum(alpha_WT_t * delta))
 print(
-    f"[params] Θ_PV={Theta_PV:.1f} h (from PVWatts AC output), "
-    f"Θ_WT={Theta_WT:.1f} h (from wind speed→power curve)"
+    f"[params] Θ_PV={Theta_PV:.1f} h (PVWatts AC), "
+    f"Θ_WT={Theta_WT:.1f} h (hub-height shear + scale×{_wind_scale:.2f}, "
+    f"v_hub_mean_raw={_v_hub_mean:.2f} m/s → {_v_hub_mean*_wind_scale:.2f} m/s)"
 )
 
 # MILP relaxation of Word's strict inequality 0 < E_{t+1}

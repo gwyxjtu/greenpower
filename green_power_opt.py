@@ -47,7 +47,10 @@ def run_optimization(X_GD_bound, output_dir="."):
     x_WT = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_WT")
     x_PV = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_PV")
     x_ST = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_ST")
-    x_GD = model.addVar(lb=0, ub=200, vtype=GRB.CONTINUOUS, name="x_GD")
+    if X_GD_bound > 0:
+        x_GD = model.addVar(lb=X_GD_bound, ub=X_GD_bound, vtype=GRB.CONTINUOUS, name="x_GD")
+    else:
+        x_GD = model.addVar(lb=0, ub=200, vtype=GRB.CONTINUOUS, name="x_GD")
     
     # Operation variables for each time step t (0 to T-1)
     p_WT = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_WT")
@@ -112,6 +115,8 @@ def run_optimization(X_GD_bound, output_dir="."):
     # (3) & (4) Physical constraints of renewable energy
     model.addConstrs((p_WT[t] <= p.alpha_WT_t[t] * x_WT for t in range(p.T)), name="c_wt_max")
     model.addConstrs((p_PV[t] <= p.alpha_PV_t[t] * x_PV for t in range(p.T)), name="c_pv_max")
+    # PV land-use: A(x^{PV}) = a_PV * x_PV ≤ S^{PV,MAX}
+    model.addConstr(p.a_PV * x_PV <= p.S_PV_MAX, name="c_pv_area")
     
     # (5) Physical constraints of energy storage system
     # Image form:
@@ -701,6 +706,7 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         
         model.addConstrs((p_WT[t] <= p.alpha_WT_t[t] * x_WT for t in range(p.T)), name="c_wt_max")
         model.addConstrs((p_PV[t] <= p.alpha_PV_t[t] * x_PV for t in range(p.T)), name="c_pv_max")
+        model.addConstr(p.a_PV * x_PV <= p.S_PV_MAX, name="c_pv_area")
         
         # Storage: image formulation with linearized w = z * p
         model.addConstrs((w_ST_C[t] <= p.P_ST_MAX_C * z1[t] for t in range(p.T)), name="c_wC_z")
@@ -839,4 +845,5 @@ if __name__ == "__main__":
     #     for X_GD_bound in X_GD_bounds:
     #         _run_optimization_job(X_GD_bound)
     # run_sensitivity_analysis()
+    run_optimization(60, output_dir="results/x_gd_60")
     run_optimization(0, output_dir="results/x_gd_free")
