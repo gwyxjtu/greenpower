@@ -275,8 +275,8 @@ MAX_SENSITIVITY_WORKERS = 8
 DEFAULT_D = 50.0
 DEFAULT_PHI = 0.6
 DEFAULT_THETA = 0.3
-SENSITIVITY_RESULTS_DIR = "results/sensitivity"
-SENSITIVITY_MIP_GAP = 0.05          # bulk sweep stopping tolerance (1%)
+SENSITIVITY_RESULTS_DIR = "results/sensitivity_mu_zero_xgd_free"
+SENSITIVITY_MIP_GAP = 0.01          # bulk sweep stopping tolerance (1%)
 SENSITIVITY_REFINE_MIP_GAP = 0.01   # refined points stopping tolerance (1%)
 MAIN_MIP_GAP = 0.01                 # run_optimization stopping tolerance (1%)
 
@@ -286,7 +286,11 @@ def _format_sensitivity_tag(sweep_key, value):
     if sweep_key == "D":
         v = int(value) if float(value).is_integer() else value
         return f"D_{v}"
-    return f"{sweep_key}_{float(value):.1f}"
+    v = float(value)
+    # Fine grids (e.g. 0.80–1.00) need 2–3 decimals to avoid collisions
+    if abs(v * 100 - round(v * 100)) < 1e-9:
+        return f"{sweep_key}_{v:.2f}"
+    return f"{sweep_key}_{v:.3f}"
 
 
 def _sensitivity_case_dir(sweep_key, value):
@@ -385,7 +389,7 @@ def _save_sensitivity_case_files(
             ])
 
 
-def _run_sensitivity_point(D, phi, theta, mip_gap, output_dir):
+def _run_sensitivity_point(D, phi, theta, mip_gap, output_dir, mu_re=None):
     """Process-pool worker: one sensitivity case with explicit parameters."""
     return run_single_optimization(
         D=D,
@@ -393,19 +397,22 @@ def _run_sensitivity_point(D, phi, theta, mip_gap, output_dir):
         theta=theta,
         mip_gap=mip_gap,
         output_dir=output_dir,
+        mu_re=mu_re,
     )
 
 
-def _parallel_sensitivity_sweep(tasks, sort_key, mip_gap=SENSITIVITY_MIP_GAP):
+def _parallel_sensitivity_sweep(tasks, sort_key, mip_gap=SENSITIVITY_MIP_GAP, mu_re=None):
     """
     Run sensitivity cases in parallel (up to MAX_SENSITIVITY_WORKERS).
     Each task is a dict with keys D, phi, theta.
+    mu_re: if not None, override μ_PV/μ_WT energy prices (e.g. 0 for free RE energy).
     """
     if not tasks:
         return []
 
     max_workers = min(len(tasks), MAX_SENSITIVITY_WORKERS)
-    print(f"   Running {len(tasks)} cases in parallel (max_workers={max_workers}, MIPGap={mip_gap:.0%})...")
+    print(f"   Running {len(tasks)} cases in parallel (max_workers={max_workers}, MIPGap={mip_gap:.0%}"
+          + (f", mu_re={mu_re}" if mu_re is not None else "") + ")...")
     results = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
@@ -418,6 +425,7 @@ def _parallel_sensitivity_sweep(tasks, sort_key, mip_gap=SENSITIVITY_MIP_GAP):
                 t["theta"],
                 mip_gap,
                 output_dir,
+                mu_re,
             )] = t
         done = 0
         for future in as_completed(futures):
@@ -552,79 +560,60 @@ def _save_sensitivity_summary(results, sweep_key, plot_filename, excel_filename,
 
 
 def run_sensitivity_analysis():
-    """Run sensitivity analysis for three key parameters and generate plots."""
+    """
+    Sensitivity with x_GD free, μ_PV/μ_WT=0:
+      - phi (self-consumption) 0.80–1.00, 10 points
+      - theta (RE/load) 0.80–1.00, 10 points
+    """
     print("\n" + "="*60)
-    print(" Sensitivity Analysis: Parameter Impact on Unit Cost")
+    print(" Sensitivity Analysis (x_GD free, μ=0, fine grid 80%–100%)")
     print("="*60)
     
-    # Create output folders
     os.makedirs("plot", exist_ok=True)
     os.makedirs(SENSITIVITY_RESULTS_DIR, exist_ok=True)
+
+    # 10 points from 80% to 100% (inclusive)
+    fine_values = [round(float(v), 4) for v in np.linspace(0.8, 1.0, 10)]
     
     # ============================================================
-    # 1. Sensitivity Analysis: D (Direct Connection Distance)
+    # 1. phi: Min RE self-consumption ratio (θ fixed at DEFAULT_THETA)
     # ============================================================
-    # print("\n1. Analyzing impact of D (connection distance)...")
-    # D_values = np.arange(10, 100, 10)  # 10 to 80 km, step 10
-    # D_tasks = [
-    #     {"D": float(D_val), "phi": DEFAULT_PHI, "theta": DEFAULT_THETA}
-    #     for D_val in D_values
-    # ]
-    # D_results = _parallel_sensitivity_sweep(D_tasks, sort_key="D")
-    # _save_sensitivity_summary(
-    #     D_results,
-    #     sweep_key="D",
-    #     plot_filename="plot/D_vs_c_ele.png",
-    #     excel_filename="plot/sensitivity_D.xlsx",
-    #     title="Impact of Connection Distance on Unit Electricity Cost",
-    #     xlabel="Direct Connection Distance (km)",
-    #     marker="o-",
-    #     color="#2E86AB",
-    # )
-    
-    # ============================================================
-    # 2. Sensitivity Analysis: phi (Min RE self-consumption ratio)
-    # ============================================================
-    print("\n2. Analyzing impact of phi (RE self-consumption ratio)...")
-    phi_values = np.arange(0.1, 1.0, 0.1)
+    print("\n1. Analyzing impact of phi (RE self-consumption ratio)...")
+    print(f"   Fixed: x_GD=free, theta={DEFAULT_THETA}, D={DEFAULT_D}")
+    print(f"   phi grid: {fine_values}")
     phi_tasks = [
-        {"D": DEFAULT_D, "phi": round(float(phi_val), 1), "theta": DEFAULT_THETA}
-        for phi_val in phi_values
+        {"D": DEFAULT_D, "phi": phi_val, "theta": DEFAULT_THETA}
+        for phi_val in fine_values
     ]
-    phi_results = _parallel_sensitivity_sweep(phi_tasks, sort_key="phi")
+    phi_results = _parallel_sensitivity_sweep(phi_tasks, sort_key="phi", mu_re=0.0)
     _save_sensitivity_summary(
         phi_results,
         sweep_key="phi",
-        plot_filename="plot/phi_vs_c_ele.png",
-        excel_filename="plot/sensitivity_phi.xlsx",
-        title="Impact of RE Self-consumption Ratio on Unit Electricity Cost",
+        plot_filename="plot/phi_vs_c_ele_mu_zero_80_100_xgd_free.png",
+        excel_filename="plot/sensitivity_phi_mu_zero_80_100_xgd_free.xlsx",
+        title="Self-consumption φ ∈ [0.8, 1.0] (μ=0, x_GD free)",
         xlabel="Min RE Self-consumption Ratio (φ)",
         marker="s-",
         color="#A23B72",
     )
     
-    # # ============================================================
-    # # 3. Sensitivity Analysis: theta (Min RE generation to load ratio)
-    # # ============================================================
-    print("\n3. Analyzing impact of theta (RE generation ratio)...")
-    theta_values = np.arange(0.1, 1.0, 0.1)
+    # ============================================================
+    # 2. theta: Min RE generation to load ratio (φ fixed at DEFAULT_PHI)
+    # ============================================================
+    print("\n2. Analyzing impact of theta (RE generation ratio)...")
+    print(f"   Fixed: x_GD=free, phi={DEFAULT_PHI}, D={DEFAULT_D}")
+    print(f"   theta grid: {fine_values}")
     theta_tasks = [
-        {"D": DEFAULT_D, "phi": DEFAULT_PHI, "theta": round(float(theta_val), 1)}
-        for theta_val in theta_values
+        {"D": DEFAULT_D, "phi": DEFAULT_PHI, "theta": theta_val}
+        for theta_val in fine_values
     ]
-    theta_results = _parallel_sensitivity_sweep(theta_tasks, sort_key="theta")
-    # theta_results = _refine_sensitivity_points(
-    #     theta_results,
-    #     sort_key="theta",
-    #     refine_values=[0.3, 0.9],
-    #     fixed_params={"D": DEFAULT_D, "phi": DEFAULT_PHI},
-    # )
+    theta_results = _parallel_sensitivity_sweep(theta_tasks, sort_key="theta", mu_re=0.0)
     _save_sensitivity_summary(
         theta_results,
         sweep_key="theta",
-        plot_filename="plot/theta_vs_c_ele.png",
-        excel_filename="plot/sensitivity_theta.xlsx",
-        title="Impact of RE Generation Ratio on Unit Electricity Cost",
+        plot_filename="plot/theta_vs_c_ele_mu_zero_80_100_xgd_free.png",
+        excel_filename="plot/sensitivity_theta_mu_zero_80_100_xgd_free.xlsx",
+        title="RE Share θ ∈ [0.8, 1.0] (μ=0, x_GD free)",
         xlabel="Min RE Generation to Load Ratio (θ)",
         marker="^-",
         color="#F18F01",
@@ -634,7 +623,8 @@ def run_sensitivity_analysis():
     print(" All sensitivity analysis plots and data exported!")
     print("="*60)
 
-def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MIP_GAP, output_dir=None):
+
+def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MIP_GAP, output_dir=None, mu_re=None):
     """
     Run single optimization and return key results.
     Used for sensitivity analysis.
@@ -642,10 +632,13 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
     D, phi, theta: optional overrides (defaults from params module).
     mip_gap: Gurobi MIP optimality gap tolerance (stopping criterion).
     output_dir: if set, save optimization_results.txt and timeseries_results.csv.
+    mu_re: if not None, override μ_PV/μ_WT (万元/MWh) for this solve.
     """
     D_val = p.D if D is None else D
     phi_val = p.phi if phi is None else phi
     theta_val = p.theta if theta is None else theta
+    mu_PV_t = np.full(p.T, float(mu_re)) if mu_re is not None else p.mu_PV_t
+    mu_WT_t = np.full(p.T, float(mu_re)) if mu_re is not None else p.mu_WT_t
 
     try:
         # Create model
@@ -660,7 +653,7 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         x_WT = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_WT")
         x_PV = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_PV")
         x_ST = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_ST")
-        x_GD = model.addVar(lb=60,ub=60, vtype=GRB.CONTINUOUS, name="x_GD")
+        x_GD = model.addVar(lb=0, ub=200, vtype=GRB.CONTINUOUS, name="x_GD")
         
         p_WT = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_WT")
         p_PV = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_PV")
@@ -680,10 +673,10 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         w_ST_C = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="w_ST_C")
         w_ST_D = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="w_ST_D")
         
-        # Objective (disclosure doc formula (1))
+        # Objective (disclosure doc formula (1)); mu_PV/mu_WT may be overridden
         cost_investment = p.R * (p.lambda_WT * x_WT + p.lambda_PV * x_PV + p.lambda_ST * x_ST + p.lambda_GD * x_GD)
         cost_re_energy = gp.quicksum(
-            (p.mu_PV_t[t] * p_PV[t] + p.mu_WT_t[t] * p_WT[t]) * p.delta for t in range(p.T)
+            (mu_PV_t[t] * p_PV[t] + mu_WT_t[t] * p_WT[t]) * p.delta for t in range(p.T)
         )
         cost_grid_buy = gp.quicksum(p.mu_EB_t[t] * p_GD[t] * p.delta for t in range(p.T))
         cost_grid_fixed = p.M * (p.mu_DC * x_GD + 730 * p.mu_ED * x_GD * p.L_bar)
@@ -735,7 +728,7 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         avail_re = x_PV * p.Theta_PV + x_WT * p.Theta_WT
         
         model.addConstr(sum_gd_u <= p.psi * avail_re, name="c_grid_prop")
-        model.addConstr(sum_re - sum_gd_u == phi_val * avail_re, name="c_re_prop1")
+        model.addConstr(sum_re - sum_gd_u >= phi_val * avail_re, name="c_re_prop1")
         sum_load = gp.quicksum(p.load_t[t] * p.delta for t in range(p.T))
         model.addConstr(sum_re >= theta_val * sum_load, name="c_re_prop2")
         
@@ -752,7 +745,7 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
             c_grid_energy = sum(
                 (p.mu_EB_t[t] + p.mu_EO_t[t] + p.mu_EL_t[t]) * p_GD[t].X * p.delta
                 + p.mu_EG_t[t] * (p_PV[t].X + p_WT[t].X + p_GD[t].X) * p.delta
-                + (p.mu_PV_t[t] * p_PV[t].X + p.mu_WT_t[t] * p_WT[t].X) * p.delta
+                + (mu_PV_t[t] * p_PV[t].X + mu_WT_t[t] * p_WT[t].X) * p.delta
                 for t in range(p.T)
             )
             rev_mkt = sum(p.mu_ES_t[t] * p_GD_U[t].X * p.delta for t in range(p.T))
@@ -844,6 +837,8 @@ if __name__ == "__main__":
     # else:
     #     for X_GD_bound in X_GD_bounds:
     #         _run_optimization_job(X_GD_bound)
-    # run_sensitivity_analysis()
-    run_optimization(60, output_dir="results/x_gd_60")
-    run_optimization(0, output_dir="results/x_gd_free")
+    # run_optimization(60, output_dir="results/x_gd_60")
+    # run_optimization(0, output_dir="results/x_gd_free")
+    # Sensitivity: μ_PV/μ_WT=0 via mu_re, x_GD=60 fixed in run_single_optimization
+    print(f"[sensitivity] mu_re=0, x_GD=free, S_PV_MAX={p.S_PV_MAX}")
+    run_sensitivity_analysis()

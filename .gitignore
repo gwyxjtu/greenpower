@@ -1,0 +1,31 @@
+# 求解与灵敏度输出（体积大、可本地再生）
+results/
+plot/
+optimization_results.txt
+timeseries_results.csv
+*.ilp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# LaTeX 中间文件
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.synctex.gz
+*.out
+*.toc
+
+# 系统 / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 压缩包备份
+*.zip
