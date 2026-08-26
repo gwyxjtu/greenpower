@@ -11,6 +11,42 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # Import parameters and synthetic data
 import params as p
 
+
+def unit_electricity_cost(c_inv, c_conn, annual_net, total_load):
+    """
+    Unit cost aligned with the objective: J / annual load.
+    J = R * (c_inv + c_conn) + annual_net  [万元/年]
+    Returns 元/kWh (×10 converts 万元/MWh).
+    """
+    if total_load <= 0:
+        return 0.0
+    J = p.R * (c_inv + c_conn) + annual_net
+    return J / total_load * 10
+
+
+def unit_cost_label():
+    """Axis / result-file label; R=0 means opex-only (capex not in J)."""
+    if abs(p.R) < 1e-12:
+        return "Unit Electricity Cost (R=0, opex only)"
+    return f"Unit Electricity Cost (CRF {p.discount_rate:.0%}/{p.project_life}yr)"
+
+
+def apply_runtime_overrides(mu_re_yuan=None, r0=False, phi=None, theta=None):
+    """In-memory overrides. mu_re_yuan is 元/kWh. Does not write params.py."""
+    if r0:
+        p.R = 0.0
+        p.CRF = 0.0
+    if mu_re_yuan is not None:
+        v = float(mu_re_yuan) * 0.1  # 万元/MWh
+        p.mu_PV = v
+        p.mu_WT = v
+        p.mu_PV_t[:] = v
+        p.mu_WT_t[:] = v
+    if phi is not None:
+        p.phi = float(phi)
+    if theta is not None:
+        p.theta = float(theta)
+
 def run_optimization(X_GD_bound, output_dir="."):
     os.makedirs(output_dir, exist_ok=True)
     results_path = os.path.join(output_dir, "optimization_results.txt")
@@ -192,7 +228,6 @@ def run_optimization(X_GD_bound, output_dir="."):
             f.write(f" - Grid Transformer (x_GD): {x_GD.X:.2f} MW\n")
             
             # Real (un-annualized) cost breakdown
-            N = p.project_life  # project lifetime in years
             c_inv = p.lambda_WT * x_WT.X + p.lambda_PV * x_PV.X + p.lambda_ST * x_ST.X + p.lambda_GD * x_GD.X
             c_conn = p.mu_TL * p.D
             c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ED * x_GD.X * p.L_bar)
@@ -204,9 +239,8 @@ def run_optimization(X_GD_bound, output_dir="."):
             )
             rev_mkt = sum(p.mu_ES_t[t] * p_GD_U[t].X * p.delta for t in range(p.T))
             total_load = sum(p.load_t[t] for t in range(p.T))
-            # LCOE = lifetime total net cost / lifetime total energy
-            # c_inv & c_conn are one-time; c_grid & rev_mkt are annual; ×10 converts 万元/MWh -> 元/kWh
-            c_ele = ((c_inv + c_conn) + N * (c_grid + c_grid_energy - rev_mkt)) / (N * total_load) * 10
+            # Same annualization as J (CRF), then ÷ load; ×10 converts 万元/MWh -> 元/kWh
+            c_ele = unit_electricity_cost(c_inv, c_conn, c_grid + c_grid_energy - rev_mkt, total_load)
             
             f.write("\n [Cost Breakdown - Real Prices] \n")
             f.write(f" - Equipment Investment (one-time): {c_inv:.2f} 万元\n")
@@ -215,7 +249,7 @@ def run_optimization(X_GD_bound, output_dir="."):
             f.write(f" - Annual Energy/Tariff Cost (EB+EO+EL+EG+RE): {c_grid_energy:.2f} 万元/年\n")
             f.write(f" - Annual Grid Charge (total): {c_grid + c_grid_energy:.2f} 万元/年\n")
             f.write(f" - Annual Market Revenue: {rev_mkt:.2f} 万元/年\n")
-            f.write(f" - Unit Electricity Cost (LCOE, {N}-yr lifecycle): {c_ele:.4f} 元/kWh\n")
+            f.write(f" - {unit_cost_label()}: {c_ele:.4f} 元/kWh\n")
             
             total_re = sum((p_WT[t].X + p_PV[t].X) * p.delta for t in range(p.T))
             total_gd_u = sum(p_GD_U[t].X * p.delta for t in range(p.T))
@@ -366,7 +400,7 @@ def _save_sensitivity_case_files(
         f.write(f" - Annual Grid Energy Cost: {c_grid_energy:.2f} 万元/年\n")
         f.write(f" - Annual Grid Charge (total): {c_grid:.2f} 万元/年\n")
         f.write(f" - Annual Market Revenue: {rev_mkt:.2f} 万元/年\n")
-        f.write(f" - Unit Electricity Cost (LCOE, {p.project_life}-yr lifecycle): {c_ele:.4f} 元/kWh\n")
+        f.write(f" - {unit_cost_label()}: {c_ele:.4f} 元/kWh\n")
         f.write("\n [Energy Statistics] \n")
         f.write(f" - Total Renewable Generation: {total_re:.2f} MWh\n")
         f.write(f" - Total Load Demand: {total_load:.2f} MWh\n")
@@ -389,7 +423,7 @@ def _save_sensitivity_case_files(
             ])
 
 
-def _run_sensitivity_point(D, phi, theta, mip_gap, output_dir, mu_re=None):
+def _run_sensitivity_point(D, phi, theta, mip_gap, output_dir, mu_re=None, x_GD_bound=0):
     """Process-pool worker: one sensitivity case with explicit parameters."""
     return run_single_optimization(
         D=D,
@@ -398,21 +432,25 @@ def _run_sensitivity_point(D, phi, theta, mip_gap, output_dir, mu_re=None):
         mip_gap=mip_gap,
         output_dir=output_dir,
         mu_re=mu_re,
+        x_GD_bound=x_GD_bound,
     )
 
 
-def _parallel_sensitivity_sweep(tasks, sort_key, mip_gap=SENSITIVITY_MIP_GAP, mu_re=None):
+def _parallel_sensitivity_sweep(tasks, sort_key, mip_gap=SENSITIVITY_MIP_GAP, mu_re=None, x_GD_bound=0):
     """
     Run sensitivity cases in parallel (up to MAX_SENSITIVITY_WORKERS).
     Each task is a dict with keys D, phi, theta.
     mu_re: if not None, override μ_PV/μ_WT energy prices (e.g. 0 for free RE energy).
+    x_GD_bound: >0 fixes transformer capacity (MW); 0 means free (lb=0, ub=200).
     """
     if not tasks:
         return []
 
     max_workers = min(len(tasks), MAX_SENSITIVITY_WORKERS)
     print(f"   Running {len(tasks)} cases in parallel (max_workers={max_workers}, MIPGap={mip_gap:.0%}"
-          + (f", mu_re={mu_re}" if mu_re is not None else "") + ")...")
+          + (f", mu_re={mu_re}" if mu_re is not None else "")
+          + (f", x_GD={x_GD_bound}" if x_GD_bound else ", x_GD=free")
+          + ")...")
     results = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
@@ -426,6 +464,7 @@ def _parallel_sensitivity_sweep(tasks, sort_key, mip_gap=SENSITIVITY_MIP_GAP, mu
                 mip_gap,
                 output_dir,
                 mu_re,
+                x_GD_bound,
             )] = t
         done = 0
         for future in as_completed(futures):
@@ -515,25 +554,18 @@ _SENSITIVITY_EXPORT_COLUMNS = [
 ]
 
 
-def _save_sensitivity_summary(results, sweep_key, plot_filename, excel_filename, title, xlabel, marker, color):
-    """Save one sensitivity plot and Excel summary."""
-    if not results:
-        return
-
-    x_vals = [r[sweep_key] for r in results]
-    c_ele_vals = [r["c_ele"] for r in results]
-
+def _plot_c_ele_curve(x_vals, c_ele_vals, plot_filename, title, xlabel, marker, color, sweep_key):
+    """Draw LCOE vs sweep parameter. Ylabel stays ASCII (DejaVu has no 元)."""
     plt.figure(figsize=(10, 6))
     ax = plt.gca()
     ax.plot(x_vals, c_ele_vals, marker, linewidth=2, markersize=8, color=color)
     ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel("Unit Electricity Cost (元/kWh)", fontsize=12)
+    ax.set_ylabel("Unit Electricity Cost (yuan/kWh, CRF)", fontsize=12)
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.grid(True, alpha=0.3)
     if sweep_key in ("phi", "theta"):
         ax.set_xticks(x_vals)
 
-    # Show actual LCOE values; disable Matplotlib offset/scientific notation (e.g. 1e-6+4.4125e-1).
     y_min, y_max = min(c_ele_vals), max(c_ele_vals)
     y_span = y_max - y_min
     y_pad = max(y_span * 0.15, 0.002)
@@ -550,6 +582,16 @@ def _save_sensitivity_summary(results, sweep_key, plot_filename, excel_filename,
     print(f"   ✓ Plot saved: {plot_filename}")
     plt.close()
 
+
+def _save_sensitivity_summary(results, sweep_key, plot_filename, excel_filename, title, xlabel, marker, color):
+    """Save one sensitivity plot and Excel summary."""
+    if not results:
+        return
+
+    x_vals = [r[sweep_key] for r in results]
+    c_ele_vals = [r["c_ele"] for r in results]
+    _plot_c_ele_curve(x_vals, c_ele_vals, plot_filename, title, xlabel, marker, color, sweep_key)
+
     df = pd.DataFrame(results)
     export_cols = [src for src, _ in _SENSITIVITY_EXPORT_COLUMNS if src in df.columns]
     df_export = df[export_cols].copy()
@@ -559,61 +601,65 @@ def _save_sensitivity_summary(results, sweep_key, plot_filename, excel_filename,
     print(f"   ✓ Excel saved: {excel_filename}")
 
 
-def run_sensitivity_analysis():
+def run_sensitivity_analysis(mu_re=0.0, x_GD_bound=0):
     """
-    Sensitivity with x_GD free, μ_PV/μ_WT=0:
-      - phi (self-consumption) 0.80–1.00, 10 points
-      - theta (RE/load) 0.80–1.00, 10 points
+    φ / θ grids 80%–100% (10 points).
+    mu_re: 万元/MWh override for μ_PV/μ_WT (0 = free RE energy).
+    x_GD_bound: >0 fixes transformer MW; 0 = free.
     """
+    global SENSITIVITY_RESULTS_DIR
+    gd_tag = f"xgd_{int(x_GD_bound)}" if x_GD_bound else "xgd_free"
+    mu_tag = "mu_zero" if abs(float(mu_re)) < 1e-12 else "mu"
+    SENSITIVITY_RESULTS_DIR = f"results/sensitivity_{mu_tag}_{gd_tag}"
+    gd_label = "x_GD free" if not x_GD_bound else f"x_GD={x_GD_bound:g}"
+    mu_label = "μ=0" if abs(float(mu_re)) < 1e-12 else f"μ={float(mu_re)*10:.2f} 元/kWh"
+
     print("\n" + "="*60)
-    print(" Sensitivity Analysis (x_GD free, μ=0, fine grid 80%–100%)")
+    print(f" Sensitivity Analysis ({gd_label}, {mu_label}, fine grid 80%–100%)")
     print("="*60)
-    
+
     os.makedirs("plot", exist_ok=True)
     os.makedirs(SENSITIVITY_RESULTS_DIR, exist_ok=True)
 
-    # 10 points from 80% to 100% (inclusive)
     fine_values = [round(float(v), 4) for v in np.linspace(0.8, 1.0, 10)]
-    
-    # ============================================================
-    # 1. phi: Min RE self-consumption ratio (θ fixed at DEFAULT_THETA)
-    # ============================================================
+
     print("\n1. Analyzing impact of phi (RE self-consumption ratio)...")
-    print(f"   Fixed: x_GD=free, theta={DEFAULT_THETA}, D={DEFAULT_D}")
+    print(f"   Fixed: {gd_label}, theta={DEFAULT_THETA}, D={DEFAULT_D}")
     print(f"   phi grid: {fine_values}")
     phi_tasks = [
         {"D": DEFAULT_D, "phi": phi_val, "theta": DEFAULT_THETA}
         for phi_val in fine_values
     ]
-    phi_results = _parallel_sensitivity_sweep(phi_tasks, sort_key="phi", mu_re=0.0)
+    phi_results = _parallel_sensitivity_sweep(
+        phi_tasks, sort_key="phi", mu_re=mu_re, x_GD_bound=x_GD_bound,
+    )
     _save_sensitivity_summary(
         phi_results,
         sweep_key="phi",
-        plot_filename="plot/phi_vs_c_ele_mu_zero_80_100_xgd_free.png",
-        excel_filename="plot/sensitivity_phi_mu_zero_80_100_xgd_free.xlsx",
-        title="Self-consumption φ ∈ [0.8, 1.0] (μ=0, x_GD free)",
+        plot_filename=f"plot/phi_vs_c_ele_{mu_tag}_80_100_{gd_tag}.png",
+        excel_filename=f"plot/sensitivity_phi_{mu_tag}_80_100_{gd_tag}.xlsx",
+        title=f"Self-consumption φ ∈ [0.8, 1.0] ({mu_label}, {gd_label})",
         xlabel="Min RE Self-consumption Ratio (φ)",
         marker="s-",
         color="#A23B72",
     )
-    
-    # ============================================================
-    # 2. theta: Min RE generation to load ratio (φ fixed at DEFAULT_PHI)
-    # ============================================================
+
     print("\n2. Analyzing impact of theta (RE generation ratio)...")
-    print(f"   Fixed: x_GD=free, phi={DEFAULT_PHI}, D={DEFAULT_D}")
+    print(f"   Fixed: {gd_label}, phi={DEFAULT_PHI}, D={DEFAULT_D}")
     print(f"   theta grid: {fine_values}")
     theta_tasks = [
         {"D": DEFAULT_D, "phi": DEFAULT_PHI, "theta": theta_val}
         for theta_val in fine_values
     ]
-    theta_results = _parallel_sensitivity_sweep(theta_tasks, sort_key="theta", mu_re=0.0)
+    theta_results = _parallel_sensitivity_sweep(
+        theta_tasks, sort_key="theta", mu_re=mu_re, x_GD_bound=x_GD_bound,
+    )
     _save_sensitivity_summary(
         theta_results,
         sweep_key="theta",
-        plot_filename="plot/theta_vs_c_ele_mu_zero_80_100_xgd_free.png",
-        excel_filename="plot/sensitivity_theta_mu_zero_80_100_xgd_free.xlsx",
-        title="RE Share θ ∈ [0.8, 1.0] (μ=0, x_GD free)",
+        plot_filename=f"plot/theta_vs_c_ele_{mu_tag}_80_100_{gd_tag}.png",
+        excel_filename=f"plot/sensitivity_theta_{mu_tag}_80_100_{gd_tag}.xlsx",
+        title=f"RE Share θ ∈ [0.8, 1.0] ({mu_label}, {gd_label})",
         xlabel="Min RE Generation to Load Ratio (θ)",
         marker="^-",
         color="#F18F01",
@@ -624,7 +670,7 @@ def run_sensitivity_analysis():
     print("="*60)
 
 
-def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MIP_GAP, output_dir=None, mu_re=None):
+def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MIP_GAP, output_dir=None, mu_re=None, x_GD_bound=0):
     """
     Run single optimization and return key results.
     Used for sensitivity analysis.
@@ -633,6 +679,7 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
     mip_gap: Gurobi MIP optimality gap tolerance (stopping criterion).
     output_dir: if set, save optimization_results.txt and timeseries_results.csv.
     mu_re: if not None, override μ_PV/μ_WT (万元/MWh) for this solve.
+    x_GD_bound: >0 fixes transformer capacity (MW); 0 means free (lb=0, ub=200).
     """
     D_val = p.D if D is None else D
     phi_val = p.phi if phi is None else phi
@@ -653,7 +700,10 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         x_WT = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_WT")
         x_PV = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_PV")
         x_ST = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_ST")
-        x_GD = model.addVar(lb=0, ub=200, vtype=GRB.CONTINUOUS, name="x_GD")
+        if x_GD_bound and x_GD_bound > 0:
+            x_GD = model.addVar(lb=x_GD_bound, ub=x_GD_bound, vtype=GRB.CONTINUOUS, name="x_GD")
+        else:
+            x_GD = model.addVar(lb=0, ub=200, vtype=GRB.CONTINUOUS, name="x_GD")
         
         p_WT = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_WT")
         p_PV = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_PV")
@@ -738,7 +788,6 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         if model.SolCount > 0:
             mip_gap_achieved = model.MIPGap
             # Real (un-annualized) cost breakdown
-            N = p.project_life  # project lifetime in years
             c_inv = p.lambda_WT * x_WT.X + p.lambda_PV * x_PV.X + p.lambda_ST * x_ST.X + p.lambda_GD * x_GD.X
             c_conn = p.mu_TL * D_val
             c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ED * x_GD.X * p.L_bar)
@@ -750,8 +799,7 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
             )
             rev_mkt = sum(p.mu_ES_t[t] * p_GD_U[t].X * p.delta for t in range(p.T))
             total_load = sum(p.load_t[t] for t in range(p.T))
-            # LCOE = lifetime total net cost / lifetime total energy; ×10 converts 万元/MWh -> 元/kWh
-            c_ele = ((c_inv + c_conn) + N * (c_grid + c_grid_energy - rev_mkt)) / (N * total_load) * 10 if total_load > 0 else 0
+            c_ele = unit_electricity_cost(c_inv, c_conn, c_grid + c_grid_energy - rev_mkt, total_load)
 
             if output_dir is not None:
                 _save_sensitivity_case_files(
@@ -814,31 +862,61 @@ def _run_optimization_job(X_GD_bound):
     return X_GD_bound
 
 
+def _cli(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Green-power MILP: capacity planning (params.py defaults, optional overrides).",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("solve", help="one capacity-planning solve (WT/PV/ST free)")
+    sp.add_argument("--x-gd", type=float, default=60.0, help="transformer MW; 0 = free 0–200")
+    sp.add_argument("--mu-re", type=float, default=None, help="μ_PV=μ_WT in 元/kWh; omit = params.py")
+    sp.add_argument("--r0", action="store_true", help="set CRF R=0 (opex-only objective)")
+    sp.add_argument("--phi", type=float, default=None)
+    sp.add_argument("--theta", type=float, default=None)
+    sp.add_argument("--out", type=str, default=None)
+
+    sp = sub.add_parser("sensitivity", help="phi/theta grids (default: mu=0, x_GD free, 80-100 percent)")
+    sp.add_argument("--mu-re", type=float, default=0.0, help="μ_PV=μ_WT in 元/kWh (default 0)")
+    sp.add_argument("--x-gd", type=float, default=0.0, help="transformer MW; 0 = free")
+
+    args = parser.parse_args(argv)
+    if args.cmd == "solve":
+        apply_runtime_overrides(mu_re_yuan=args.mu_re, r0=args.r0, phi=args.phi, theta=args.theta)
+        xgd = args.x_gd
+        if args.out:
+            out = args.out
+        else:
+            stem = f"x_gd_{int(xgd) if xgd and float(xgd).is_integer() else xgd}" if xgd else "x_gd_free"
+            if args.mu_re == 0.0:
+                stem += "_mu_zero"
+            elif args.mu_re is not None:
+                stem += f"_mu{args.mu_re:.2f}"
+            if args.r0:
+                stem += "_R0"
+            out = os.path.join("results", stem)
+        print(
+            f"[solve] x_GD={'free' if not xgd else xgd}  mu_re={args.mu_re}  "
+            f"R={'0' if args.r0 else f'{p.R:.4f}'}  phi={p.phi} theta={p.theta} -> {out}"
+        )
+        run_optimization(0 if not xgd else xgd, output_dir=out)
+        return
+        print(
+            f"[solve] x_GD={'free' if not xgd else xgd}  mu_re={args.mu_re}  "
+            f"R={'0' if args.r0 else f'{p.R:.4f}'}  phi={p.phi} theta={p.theta} -> {out}"
+        )
+        run_optimization(0 if not xgd else xgd, output_dir=out)
+        return
+    if args.cmd == "sensitivity":
+        mu_wan = float(args.mu_re) * 0.1
+        print(
+            f"[sensitivity] mu_re={args.mu_re} 元/kWh  "
+            f"x_GD={'free' if not args.x_gd else args.x_gd}  S_PV_MAX={p.S_PV_MAX}"
+        )
+        run_sensitivity_analysis(mu_re=mu_wan, x_GD_bound=args.x_gd)
+
+
 if __name__ == "__main__":
-    # from concurrent.futures import ProcessPoolExecutor, as_completed
-
-    # X_GD_bounds = list(range(35, 40, 5))
-    # # Parallel: each job uses its own Gurobi model and output directory.
-    # # Set PARALLEL=False to run sequentially (writes to results/x_gd_<bound>/ either way).
-    # PARALLEL = True
-
-    # if PARALLEL and len(X_GD_bounds) > 1:
-    #     max_workers = min(len(X_GD_bounds), os.cpu_count() or 1)
-    #     print(f"Running {len(X_GD_bounds)} optimizations in parallel (max_workers={max_workers})...")
-    #     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-    #         futures = {executor.submit(_run_optimization_job, b): b for b in X_GD_bounds}
-    #         for future in as_completed(futures):
-    #             bound = futures[future]
-    #             try:
-    #                 future.result()
-    #                 print(f"[done] X_GD_bound={bound}")
-    #             except Exception as exc:
-    #                 print(f"[failed] X_GD_bound={bound}: {exc}")
-    # else:
-    #     for X_GD_bound in X_GD_bounds:
-    #         _run_optimization_job(X_GD_bound)
-    # run_optimization(60, output_dir="results/x_gd_60")
-    # run_optimization(0, output_dir="results/x_gd_free")
-    # Sensitivity: μ_PV/μ_WT=0 via mu_re, x_GD=60 fixed in run_single_optimization
-    print(f"[sensitivity] mu_re=0, x_GD=free, S_PV_MAX={p.S_PV_MAX}")
-    run_sensitivity_analysis()
+    _cli()
