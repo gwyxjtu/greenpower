@@ -1,3 +1,13 @@
+"""
+Green-power direct-connection microgrid capacity planning (Gurobi MILP).
+
+CLI
+---
+  python green_power_opt.py solve --x-gd 60 --mu-re 0
+  python green_power_opt.py sensitivity --mu-re 0 --x-gd 0
+
+Fixed-plant experiments: ``python standalone/run.py --help``.
+"""
 import gurobipy as gp
 from gurobipy import GRB
 import time
@@ -8,7 +18,6 @@ from matplotlib.ticker import FormatStrFormatter, ScalarFormatter
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# Import parameters and synthetic data
 import params as p
 
 
@@ -311,7 +320,6 @@ DEFAULT_PHI = 0.6
 DEFAULT_THETA = 0.3
 SENSITIVITY_RESULTS_DIR = "results/sensitivity_mu_zero_xgd_free"
 SENSITIVITY_MIP_GAP = 0.01          # bulk sweep stopping tolerance (1%)
-SENSITIVITY_REFINE_MIP_GAP = 0.01   # refined points stopping tolerance (1%)
 MAIN_MIP_GAP = 0.01                 # run_optimization stopping tolerance (1%)
 
 
@@ -490,46 +498,6 @@ def _parallel_sensitivity_sweep(tasks, sort_key, mip_gap=SENSITIVITY_MIP_GAP, mu
 
     results.sort(key=lambda r: r[sort_key])
     return results
-
-
-def _refine_sensitivity_points(results, sort_key, refine_values, fixed_params, mip_gap=SENSITIVITY_REFINE_MIP_GAP):
-    """Re-run selected points with a tighter MIP gap and merge into results."""
-    if not results:
-        return results
-
-    refined = []
-    for val in refine_values:
-        task = {**fixed_params, sort_key: val}
-        output_dir = _sensitivity_case_dir(sort_key, val)
-        print(f"   Refining {sort_key}={val} with MIPGap={mip_gap:.0%}...")
-        result = run_single_optimization(
-            D=task["D"],
-            phi=task["phi"],
-            theta=task["theta"],
-            mip_gap=mip_gap,
-            output_dir=output_dir,
-        )
-        if result is not None:
-            refined.append(result)
-            gap_str = (
-                f"{result['mip_gap_achieved']:.2%}"
-                if result.get("mip_gap_achieved") is not None
-                else "N/A"
-            )
-            print(
-                f"   ✓ {sort_key}={val}: LCOE={result['c_ele']:.4f} 元/kWh, "
-                f"gap={gap_str} -> {result['output_dir']}"
-            )
-        else:
-            print(f"   ✗ {sort_key}={val}: no solution")
-
-    if not refined:
-        return results
-
-    refined_map = {r[sort_key]: r for r in refined}
-    merged = [refined_map.get(r[sort_key], r) for r in results]
-    merged.sort(key=lambda r: r[sort_key])
-    return merged
 
 
 _SENSITIVITY_EXPORT_COLUMNS = [
@@ -856,11 +824,6 @@ def run_single_optimization(D=None, phi=None, theta=None, mip_gap=SENSITIVITY_MI
         print(f"   Error in optimization: {e}")
         return None
 
-def _run_optimization_job(X_GD_bound):
-    output_dir = os.path.join("results", f"x_gd_{X_GD_bound}")
-    run_optimization(X_GD_bound, output_dir=output_dir)
-    return X_GD_bound
-
 
 def _cli(argv=None):
     import argparse
@@ -897,12 +860,6 @@ def _cli(argv=None):
             if args.r0:
                 stem += "_R0"
             out = os.path.join("results", stem)
-        print(
-            f"[solve] x_GD={'free' if not xgd else xgd}  mu_re={args.mu_re}  "
-            f"R={'0' if args.r0 else f'{p.R:.4f}'}  phi={p.phi} theta={p.theta} -> {out}"
-        )
-        run_optimization(0 if not xgd else xgd, output_dir=out)
-        return
         print(
             f"[solve] x_GD={'free' if not xgd else xgd}  mu_re={args.mu_re}  "
             f"R={'0' if args.r0 else f'{p.R:.4f}'}  phi={p.phi} theta={p.theta} -> {out}"

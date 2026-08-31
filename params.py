@@ -136,9 +136,11 @@ theta = 0.30          # β: 新能源发电量 / 用电量 下限 (16)
 
 
 # ============================================================
-# 8. Time-Series Data (8760h) — SYNTHETIC PLACEHOLDERS
+# 8. Time-Series Data (8760 h)
 # ============================================================
-# Users should replace these with real data arrays of length T.
+# Load: synthetic diurnal + seasonal profile scaled to design load L.
+# PV:   PVWatts hourly AC (Yinchuan) in data/pvwatts_hourly.csv.
+# Wind: same file's 10 m wind → hub-height shear → calibrated to Theta_WT.
 
 def _normalize_cf_to_hours(alpha, target_hours, delta):
     """Scale capacity-factor series so Σ α·Δ = target_hours, keep α ∈ [0, 1]."""
