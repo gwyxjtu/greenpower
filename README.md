@@ -12,6 +12,7 @@
 | `green_power_opt.py` | Gurobi 建模与求解入口 |
 | `data/pvwatts_hourly.csv` | 银川 PVWatts 小时数据（光伏 AC + 近地面风速） |
 | `requirements.txt` | Python 依赖（不含 Gurobi） |
+| `绿电直连微电网容量规划-使用说明.docx` | 仓库介绍、参数列表与输出字段释义 |
 
 求解输出写到 `out/`（不入库，可本地删除）。
 
