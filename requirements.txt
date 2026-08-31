@@ -1,6 +1,3 @@
 numpy
-pandas
-matplotlib
-openpyxl
 # Gurobi Python API is installed with the Gurobi solver, not via pip:
 #   python -c "import gurobipy; print(gurobipy.gurobi.version())"

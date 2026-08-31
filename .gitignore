@@ -1,6 +1,6 @@
-# 求解与灵敏度输出（体积大、可本地再生；目录说明入库）
-results/**
-!results/README.md
+# 求解输出（不入库）
+out/
+results/
 plot/
 optimization_results.txt
 timeseries_results.csv
@@ -13,21 +13,10 @@ __pycache__/
 .venv/
 venv/
 
-# LaTeX 中间文件
-*.aux
-*.fdb_latexmk
-*.fls
-*.log
-*.synctex.gz
-*.out
-*.toc
-
 # 系统 / IDE
 .DS_Store
 **/.DS_Store
 .idea/
 .vscode/
 *.swp
-
-# 压缩包备份
 *.zip
