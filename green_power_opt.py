@@ -1,5 +1,5 @@
 """
-Green-power direct-connection microgrid capacity planning (Gurobi MILP).
+Green-power direct-connection microgrid capacity planning (SCIP MILP).
 
   python green_power_opt.py --x-gd 60 --mu-re 0
   python green_power_opt.py --x-gd 0 --mu-re 0
@@ -9,12 +9,13 @@ import csv
 import os
 import time
 
-import gurobipy as gp
-from gurobipy import GRB
+import pyscipopt
+from pyscipopt import SCIP_PARAMEMPHASIS, SCIP_PARAMSETTING, Model, quicksum
 
 import params as p
 
 MAIN_MIP_GAP = 0.01
+MAIN_TIME_LIMIT = 600
 
 
 def unit_electricity_cost(c_inv, c_conn, annual_net, total_load):
@@ -53,64 +54,106 @@ def apply_runtime_overrides(mu_re_yuan=None, r0=False, phi=None, theta=None):
         p.theta = float(theta)
 
 
-def run_optimization(X_GD_bound, output_dir="."):
+def _add_vars(model, n, name, vtype="C", lb=0.0, ub=None):
+    vars_ = []
+    for i in range(n):
+        kw = {"vtype": vtype, "name": f"{name}[{i}]"}
+        if vtype != "B":
+            kw["lb"] = lb
+            if ub is not None:
+                kw["ub"] = ub
+        vars_.append(model.addVar(**kw))
+    return vars_
+
+
+def _status_label(model):
+    status = model.getStatus()
+    if status in ("optimal", "gaplimit"):
+        return "OPTIMAL"
+    return f"UNFINISHED (Status {status}, Feasible solution found)"
+
+
+def _gap_str(model):
+    try:
+        gap = model.getGap()
+    except (ArithmeticError, ValueError, OverflowError):
+        return "inf"
+    if gap != gap or gap > 1e12:
+        return "inf"
+    return f"{gap:.2%}"
+
+
+def _configure_scip(model, mip_gap, time_limit):
+    model.hideOutput(False)
+    model.setParam("limits/gap", float(mip_gap))
+    model.setParam("limits/time", float(time_limit))
+    model.setParam("timing/clocktype", 2)  # wall-clock seconds
+    # Root LP is already near the integer bound; skip expensive cuts and hunt for a feasible MIP.
+    model.setEmphasis(SCIP_PARAMEMPHASIS.FEASIBILITY)
+    model.setHeuristics(SCIP_PARAMSETTING.AGGRESSIVE)
+    model.setSeparating(SCIP_PARAMSETTING.OFF)
+
+
+def run_optimization(X_GD_bound, output_dir=".", mip_gap=MAIN_MIP_GAP, time_limit=MAIN_TIME_LIMIT):
     os.makedirs(output_dir, exist_ok=True)
     results_path = os.path.join(output_dir, "optimization_results.txt")
     csv_path = os.path.join(output_dir, "timeseries_results.csv")
-    ilp_path = os.path.join(output_dir, "model.ilp")
+    lp_path = os.path.join(output_dir, "model.lp")
 
     print("=" * 60)
     print(" Green Power Microgrid Capacity Planning Model")
+    print(f" Solver: SCIP (PySCIPOpt)  gap={mip_gap}  time={time_limit}s")
     print(f" Output directory: {output_dir}")
     print("=" * 60)
     print("Building model...")
 
     start_time = time.time()
-    model = gp.Model("GreenPowerMicrogrid")
-    model.setParam("MIPGap", MAIN_MIP_GAP)
-    model.setParam("TimeLimit", 300)
-    model.setParam("Heuristics", 0.5)
+    model = Model("GreenPowerMicrogrid")
+    _configure_scip(model, mip_gap, time_limit)
 
     print("Adding variables...")
-    x_WT = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_WT")
-    x_PV = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_PV")
-    x_ST = model.addVar(lb=0, vtype=GRB.CONTINUOUS, name="x_ST")
+    x_pv_ub = p.S_PV_MAX / p.a_PV
+    x_WT = model.addVar(lb=0, ub=p.X_WT_MAX, vtype="C", name="x_WT")
+    x_PV = model.addVar(lb=0, ub=x_pv_ub, vtype="C", name="x_PV")
+    x_ST = model.addVar(lb=0, ub=p.X_ST_MAX, vtype="C", name="x_ST")
     if X_GD_bound > 0:
-        x_GD = model.addVar(lb=X_GD_bound, ub=X_GD_bound, vtype=GRB.CONTINUOUS, name="x_GD")
+        x_GD = model.addVar(lb=X_GD_bound, ub=X_GD_bound, vtype="C", name="x_GD")
+        x_gd_ub = float(X_GD_bound)
     else:
-        x_GD = model.addVar(lb=0, ub=200, vtype=GRB.CONTINUOUS, name="x_GD")
+        x_GD = model.addVar(lb=0, ub=p.X_GD_MAX, vtype="C", name="x_GD")
+        x_gd_ub = float(p.X_GD_MAX)
 
-    p_WT = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_WT")
-    p_PV = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_PV")
-    p_ST_C = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_C")
-    p_ST_D = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_ST_D")
-    p_GD = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD")
-    p_GD_U = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="p_GD_U")
-    E = model.addVars(p.T + 1, lb=0, vtype=GRB.CONTINUOUS, name="E")
-    z1 = model.addVars(p.T, vtype=GRB.BINARY, name="z1")
-    z2 = model.addVars(p.T, vtype=GRB.BINARY, name="z2")
-    y1 = model.addVars(p.T, vtype=GRB.BINARY, name="y1")
-    y2 = model.addVars(p.T, vtype=GRB.BINARY, name="y2")
-    w_ST_C = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="w_ST_C")
-    w_ST_D = model.addVars(p.T, lb=0, vtype=GRB.CONTINUOUS, name="w_ST_D")
+    p_WT = _add_vars(model, p.T, "p_WT", ub=p.X_WT_MAX)
+    p_PV = _add_vars(model, p.T, "p_PV", ub=x_pv_ub)
+    p_ST_C = _add_vars(model, p.T, "p_ST_C", ub=p.P_ST_MAX_C)
+    p_ST_D = _add_vars(model, p.T, "p_ST_D", ub=p.P_ST_MAX_D)
+    p_GD = _add_vars(model, p.T, "p_GD", ub=x_gd_ub)
+    p_GD_U = _add_vars(model, p.T, "p_GD_U", ub=x_gd_ub)
+    E = _add_vars(model, p.T + 1, "E", ub=p.X_ST_MAX)
+    z1 = _add_vars(model, p.T, "z1", vtype="B")
+    z2 = _add_vars(model, p.T, "z2", vtype="B")
+    y1 = _add_vars(model, p.T, "y1", vtype="B")
+    y2 = _add_vars(model, p.T, "y2", vtype="B")
+    w_ST_C = _add_vars(model, p.T, "w_ST_C", ub=p.P_ST_MAX_C)
+    w_ST_D = _add_vars(model, p.T, "w_ST_D", ub=p.P_ST_MAX_D)
 
     print("Setting objective function...")
     cost_investment = p.R * (
         p.lambda_WT * x_WT + p.lambda_PV * x_PV + p.lambda_ST * x_ST + p.lambda_GD * x_GD
     )
-    cost_re_energy = gp.quicksum(
+    cost_re_energy = quicksum(
         (p.mu_PV_t[t] * p_PV[t] + p.mu_WT_t[t] * p_WT[t]) * p.delta for t in range(p.T)
     )
-    cost_grid_buy = gp.quicksum(p.mu_EB_t[t] * p_GD[t] * p.delta for t in range(p.T))
+    cost_grid_buy = quicksum(p.mu_EB_t[t] * p_GD[t] * p.delta for t in range(p.T))
     cost_grid_fixed = p.M * (p.mu_DC * x_GD + 730 * p.mu_ED * x_GD * p.L_bar)
-    cost_grid_surcharge = gp.quicksum(
+    cost_grid_surcharge = quicksum(
         (p.mu_EO_t[t] + p.mu_EL_t[t]) * p_GD[t] * p.delta for t in range(p.T)
     )
-    cost_fund_EG = gp.quicksum(
+    cost_fund_EG = quicksum(
         p.mu_EG_t[t] * (p_PV[t] + p_WT[t] + p_GD[t]) * p.delta for t in range(p.T)
     )
     cost_connection = p.mu_TL * p.D * p.CRF
-    revenue_market = gp.quicksum(p.mu_ES_t[t] * p_GD_U[t] * p.delta for t in range(p.T))
+    revenue_market = quicksum(p.mu_ES_t[t] * p_GD_U[t] * p.delta for t in range(p.T))
     J = (
         cost_investment
         + cost_re_energy
@@ -121,93 +164,95 @@ def run_optimization(X_GD_bound, output_dir="."):
         + cost_connection
         - revenue_market
     )
-    model.setObjective(J, GRB.MINIMIZE)
+    model.setObjective(J, "minimize")
 
     print("Adding constraints...")
-    model.addConstrs(
-        (
-            p_WT[t] + p_PV[t] - w_ST_C[t] + w_ST_D[t] + p_GD[t] - p_GD_U[t] == p.load_t[t]
-            for t in range(p.T)
-        ),
-        name="c_power_balance",
-    )
-    model.addConstrs((p_WT[t] <= p.alpha_WT_t[t] * x_WT for t in range(p.T)), name="c_wt_max")
-    model.addConstrs((p_PV[t] <= p.alpha_PV_t[t] * x_PV for t in range(p.T)), name="c_pv_max")
-    model.addConstr(p.a_PV * x_PV <= p.S_PV_MAX, name="c_pv_area")
+    for t in range(p.T):
+        model.addCons(
+            p_WT[t] + p_PV[t] - w_ST_C[t] + w_ST_D[t] + p_GD[t] - p_GD_U[t] == p.load_t[t],
+            name=f"c_power_balance[{t}]",
+        )
+        model.addCons(p_WT[t] <= p.alpha_WT_t[t] * x_WT, name=f"c_wt_max[{t}]")
+        model.addCons(p_PV[t] <= p.alpha_PV_t[t] * x_PV, name=f"c_pv_max[{t}]")
+        model.addCons(w_ST_C[t] <= p.P_ST_MAX_C * z1[t], name=f"c_wC_z[{t}]")
+        model.addCons(w_ST_C[t] <= p_ST_C[t], name=f"c_wC_p[{t}]")
+        model.addCons(
+            w_ST_C[t] >= p_ST_C[t] - p.P_ST_MAX_C * (1 - z1[t]),
+            name=f"c_wC_lb[{t}]",
+        )
+        model.addCons(w_ST_D[t] <= p.P_ST_MAX_D * z2[t], name=f"c_wD_z[{t}]")
+        model.addCons(w_ST_D[t] <= p_ST_D[t], name=f"c_wD_p[{t}]")
+        model.addCons(
+            w_ST_D[t] >= p_ST_D[t] - p.P_ST_MAX_D * (1 - z2[t]),
+            name=f"c_wD_lb[{t}]",
+        )
+        model.addCons(
+            E[t + 1] == E[t] + (p.eta_ch * w_ST_C[t] - w_ST_D[t] / p.eta_dis) * p.delta,
+            name=f"c_E_trans[{t}]",
+        )
+        model.addCons(p_ST_C[t] <= p.P_ST_MAX_C, name=f"c_st_c_max[{t}]")
+        model.addCons(p_ST_D[t] <= p.P_ST_MAX_D, name=f"c_st_d_max[{t}]")
+        model.addCons(z1[t] + z2[t] == 1, name=f"c_st_mut_excl[{t}]")
+        # p <= x * y  (y binary) → McCormick / big-M: p <= x and p <= x_ub * y
+        model.addCons(p_GD[t] <= x_GD, name=f"c_gd_buy_cap[{t}]")
+        model.addCons(p_GD[t] <= x_gd_ub * y1[t], name=f"c_gd_buy_ind[{t}]")
+        model.addCons(p_GD_U[t] <= x_GD, name=f"c_gd_sell_cap[{t}]")
+        model.addCons(p_GD_U[t] <= x_gd_ub * y2[t], name=f"c_gd_sell_ind[{t}]")
+        model.addCons(y1[t] + y2[t] <= 1, name=f"c_gd_mut_excl[{t}]")
 
-    model.addConstrs((w_ST_C[t] <= p.P_ST_MAX_C * z1[t] for t in range(p.T)), name="c_wC_z")
-    model.addConstrs((w_ST_C[t] <= p_ST_C[t] for t in range(p.T)), name="c_wC_p")
-    model.addConstrs(
-        (w_ST_C[t] >= p_ST_C[t] - p.P_ST_MAX_C * (1 - z1[t]) for t in range(p.T)),
-        name="c_wC_lb",
-    )
-    model.addConstrs((w_ST_D[t] <= p.P_ST_MAX_D * z2[t] for t in range(p.T)), name="c_wD_z")
-    model.addConstrs((w_ST_D[t] <= p_ST_D[t] for t in range(p.T)), name="c_wD_p")
-    model.addConstrs(
-        (w_ST_D[t] >= p_ST_D[t] - p.P_ST_MAX_D * (1 - z2[t]) for t in range(p.T)),
-        name="c_wD_lb",
-    )
-    model.addConstrs(
-        (
-            E[t + 1] == E[t] + (p.eta_ch * w_ST_C[t] - w_ST_D[t] / p.eta_dis) * p.delta
-            for t in range(p.T)
-        ),
-        name="c_E_trans",
-    )
-    model.addConstrs((E[t] >= p.E_eps for t in range(1, p.T + 1)), name="c_E_min")
-    model.addConstrs((E[t] <= x_ST for t in range(p.T + 1)), name="c_E_max")
-    model.addConstr(E[0] == p.E_init, name="c_E_init")
-    model.addConstrs((p_ST_C[t] <= p.P_ST_MAX_C for t in range(p.T)), name="c_st_c_max")
-    model.addConstrs((p_ST_D[t] <= p.P_ST_MAX_D for t in range(p.T)), name="c_st_d_max")
-    model.addConstrs((z1[t] + z2[t] == 1 for t in range(p.T)), name="c_st_mut_excl")
-    model.addConstrs((p_GD[t] <= x_GD * y1[t] for t in range(p.T)), name="c_gd_buy_max")
-    model.addConstrs((p_GD_U[t] <= x_GD * y2[t] for t in range(p.T)), name="c_gd_sell_max")
-    model.addConstrs((y1[t] + y2[t] <= 1 for t in range(p.T)), name="c_gd_mut_excl")
+    model.addCons(p.a_PV * x_PV <= p.S_PV_MAX, name="c_pv_area")
+    for t in range(1, p.T + 1):
+        model.addCons(E[t] >= p.E_eps, name=f"c_E_min[{t}]")
+    for t in range(p.T + 1):
+        model.addCons(E[t] <= x_ST, name=f"c_E_max[{t}]")
+    model.addCons(E[0] == p.E_init, name="c_E_init")
 
-    sum_gd_u = gp.quicksum(p_GD_U[t] * p.delta for t in range(p.T))
-    sum_re = gp.quicksum((p_WT[t] + p_PV[t]) * p.delta for t in range(p.T))
+    sum_gd_u = quicksum(p_GD_U[t] * p.delta for t in range(p.T))
+    sum_re = quicksum((p_WT[t] + p_PV[t]) * p.delta for t in range(p.T))
     avail_re = x_PV * p.Theta_PV + x_WT * p.Theta_WT
-    model.addConstr(sum_gd_u <= p.psi * avail_re, name="c_grid_prop")
-    model.addConstr(sum_re - sum_gd_u >= p.phi * avail_re, name="c_re_prop1")
-    sum_load = gp.quicksum(p.load_t[t] * p.delta for t in range(p.T))
-    model.addConstr(sum_re >= p.theta * sum_load, name="c_re_prop2")
+    model.addCons(sum_gd_u <= p.psi * avail_re, name="c_grid_prop")
+    model.addCons(sum_re - sum_gd_u >= p.phi * avail_re, name="c_re_prop1")
+    sum_load = quicksum(p.load_t[t] * p.delta for t in range(p.T))
+    model.addCons(sum_re >= p.theta * sum_load, name="c_re_prop2")
 
     print(f"Model construction time: {time.time() - start_time:.2f} seconds")
     print("Starting optimization...")
     model.optimize()
 
-    if model.SolCount > 0:
+    status = model.getStatus()
+    nsols = model.getNSols()
+
+    if nsols > 0:
+        val = model.getVal
+        obj = model.getObjVal()
         with open(results_path, "w", encoding="utf-8") as f:
-            status_str = (
-                "OPTIMAL"
-                if model.Status == GRB.OPTIMAL
-                else f"UNFINISHED (Status {model.Status}, Feasible solution found)"
-            )
             f.write("=" * 60 + "\n")
-            f.write(f" Optimization Terminated! Status: {status_str}\n")
-            f.write(f" Total Annualized Objective: {model.ObjVal:.2f} 万元/年\n")
+            f.write(f" Optimization Terminated! Status: {_status_label(model)}\n")
+            f.write(f" Solver: SCIP (PySCIPOpt {pyscipopt.__version__})\n")
+            f.write(f" MIP gap: {_gap_str(model)}\n")
+            f.write(f" Total Annualized Objective: {obj:.2f} 万元/年\n")
             f.write("=" * 60 + "\n")
             f.write(" [Optimal Capacities] \n")
-            f.write(f" - Wind Power (x_WT): {x_WT.X:.2f} MW\n")
-            f.write(f" - Photovoltaic (x_PV): {x_PV.X:.2f} MW\n")
-            f.write(f" - Energy Storage (x_ST): {x_ST.X:.2f} MWh\n")
-            f.write(f" - Grid Transformer (x_GD): {x_GD.X:.2f} MW\n")
+            f.write(f" - Wind Power (x_WT): {val(x_WT):.2f} MW\n")
+            f.write(f" - Photovoltaic (x_PV): {val(x_PV):.2f} MW\n")
+            f.write(f" - Energy Storage (x_ST): {val(x_ST):.2f} MWh\n")
+            f.write(f" - Grid Transformer (x_GD): {val(x_GD):.2f} MW\n")
 
             c_inv = (
-                p.lambda_WT * x_WT.X
-                + p.lambda_PV * x_PV.X
-                + p.lambda_ST * x_ST.X
-                + p.lambda_GD * x_GD.X
+                p.lambda_WT * val(x_WT)
+                + p.lambda_PV * val(x_PV)
+                + p.lambda_ST * val(x_ST)
+                + p.lambda_GD * val(x_GD)
             )
             c_conn = p.mu_TL * p.D
-            c_grid = p.M * (p.mu_DC * x_GD.X + 730 * p.mu_ED * x_GD.X * p.L_bar)
+            c_grid = p.M * (p.mu_DC * val(x_GD) + 730 * p.mu_ED * val(x_GD) * p.L_bar)
             c_grid_energy = sum(
-                (p.mu_EB_t[t] + p.mu_EO_t[t] + p.mu_EL_t[t]) * p_GD[t].X * p.delta
-                + p.mu_EG_t[t] * (p_PV[t].X + p_WT[t].X + p_GD[t].X) * p.delta
-                + (p.mu_PV_t[t] * p_PV[t].X + p.mu_WT_t[t] * p_WT[t].X) * p.delta
+                (p.mu_EB_t[t] + p.mu_EO_t[t] + p.mu_EL_t[t]) * val(p_GD[t]) * p.delta
+                + p.mu_EG_t[t] * (val(p_PV[t]) + val(p_WT[t]) + val(p_GD[t])) * p.delta
+                + (p.mu_PV_t[t] * val(p_PV[t]) + p.mu_WT_t[t] * val(p_WT[t])) * p.delta
                 for t in range(p.T)
             )
-            rev_mkt = sum(p.mu_ES_t[t] * p_GD_U[t].X * p.delta for t in range(p.T))
+            rev_mkt = sum(p.mu_ES_t[t] * val(p_GD_U[t]) * p.delta for t in range(p.T))
             total_load = sum(p.load_t[t] for t in range(p.T))
             c_ele = unit_electricity_cost(c_inv, c_conn, c_grid + c_grid_energy - rev_mkt, total_load)
 
@@ -220,10 +265,10 @@ def run_optimization(X_GD_bound, output_dir="."):
             f.write(f" - Annual Market Revenue: {rev_mkt:.2f} 万元/年\n")
             f.write(f" - {unit_cost_label()}: {c_ele:.4f} 元/kWh\n")
 
-            total_re = sum((p_WT[t].X + p_PV[t].X) * p.delta for t in range(p.T))
-            total_gd_u = sum(p_GD_U[t].X * p.delta for t in range(p.T))
+            total_re = sum((val(p_WT[t]) + val(p_PV[t])) * p.delta for t in range(p.T))
+            total_gd_u = sum(val(p_GD_U[t]) * p.delta for t in range(p.T))
             total_load_e = sum(p.load_t[t] * p.delta for t in range(p.T))
-            avail_re_val = x_PV.X * p.Theta_PV + x_WT.X * p.Theta_WT
+            avail_re_val = val(x_PV) * p.Theta_PV + val(x_WT) * p.Theta_WT
             ratio_export = total_gd_u / avail_re_val if avail_re_val > 1e-9 else 0.0
             ratio_self = (total_re - total_gd_u) / avail_re_val if avail_re_val > 1e-9 else 0.0
             ratio_re_load = total_re / total_load_e if total_load_e > 1e-9 else 0.0
@@ -239,6 +284,7 @@ def run_optimization(X_GD_bound, output_dir="."):
             f.write(f" - On-grid Export (sum_gd_u): {total_gd_u:.2f} MWh\n")
 
         print(f"Optimization successful! Results saved to '{results_path}'.")
+        x_st_val = val(x_ST)
         with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(
@@ -255,36 +301,35 @@ def run_optimization(X_GD_bound, output_dir="."):
                 ]
             )
             for t in range(p.T):
-                soc_val = (E[t].X / x_ST.X) if x_ST.X > 1e-6 else 0.0
+                soc_val = (val(E[t]) / x_st_val) if x_st_val > 1e-6 else 0.0
                 writer.writerow(
                     [
                         t,
                         round(p.load_t[t], 2),
-                        round(p_WT[t].X, 2),
-                        round(p_PV[t].X, 2),
-                        round(w_ST_C[t].X, 2),
-                        round(w_ST_D[t].X, 2),
+                        round(val(p_WT[t]), 2),
+                        round(val(p_PV[t]), 2),
+                        round(val(w_ST_C[t]), 2),
+                        round(val(w_ST_D[t]), 2),
                         round(soc_val, 4),
-                        round(p_GD[t].X, 2),
-                        round(p_GD_U[t].X, 2),
+                        round(val(p_GD[t]), 2),
+                        round(val(p_GD_U[t]), 2),
                     ]
                 )
         print(f"Time-series data saved to '{csv_path}'.")
 
-    elif model.Status == GRB.INFEASIBLE:
+    elif status == "infeasible":
         print("Model is Infeasible! Please check the parameters or constraints.")
-        model.computeIIS()
-        model.write(ilp_path)
-        print(f"IIS written to '{ilp_path}'")
+        model.writeProblem(lp_path)
+        print(f"LP written to '{lp_path}'")
     else:
-        print(f"Optimization ended with status: {model.Status}")
+        print(f"Optimization ended with status: {status}")
 
 
 def _cli(argv=None):
     parser = argparse.ArgumentParser(
-        description="Green-power MILP capacity planning (params.py defaults, optional overrides).",
+        description="Green-power MILP capacity planning (SCIP; params.py defaults, optional overrides).",
     )
-    parser.add_argument("--x-gd", type=float, default=60.0, help="transformer MW; 0 = free 0–200")
+    parser.add_argument("--x-gd", type=float, default=60.0, help="transformer MW; 0 = free 0–X_GD_MAX")
     parser.add_argument(
         "--mu-re",
         type=float,
@@ -295,6 +340,18 @@ def _cli(argv=None):
     parser.add_argument("--phi", type=float, default=None)
     parser.add_argument("--theta", type=float, default=None)
     parser.add_argument("--out", type=str, default=None)
+    parser.add_argument(
+        "--mip-gap",
+        type=float,
+        default=MAIN_MIP_GAP,
+        help=f"relative MIP gap (default {MAIN_MIP_GAP})",
+    )
+    parser.add_argument(
+        "--time-limit",
+        type=float,
+        default=MAIN_TIME_LIMIT,
+        help=f"wall-clock time limit in seconds (default {MAIN_TIME_LIMIT})",
+    )
     args = parser.parse_args(argv)
 
     apply_runtime_overrides(mu_re_yuan=args.mu_re, r0=args.r0, phi=args.phi, theta=args.theta)
@@ -313,10 +370,16 @@ def _cli(argv=None):
             stem += "_R0"
         out = os.path.join("out", stem)
     print(
-        f"[solve] x_GD={'free' if not xgd else xgd}  mu_re={args.mu_re}  "
-        f"R={'0' if args.r0 else f'{p.R:.4f}'}  phi={p.phi} theta={p.theta} -> {out}"
+        f"[solve] SCIP  x_GD={'free' if not xgd else xgd}  mu_re={args.mu_re}  "
+        f"R={'0' if args.r0 else f'{p.R:.4f}'}  phi={p.phi} theta={p.theta} "
+        f"gap={args.mip_gap} time={args.time_limit}s -> {out}"
     )
-    run_optimization(0 if not xgd else xgd, output_dir=out)
+    run_optimization(
+        0 if not xgd else xgd,
+        output_dir=out,
+        mip_gap=args.mip_gap,
+        time_limit=args.time_limit,
+    )
 
 
 if __name__ == "__main__":

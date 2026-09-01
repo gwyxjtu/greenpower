@@ -5,6 +5,7 @@ plot/
 optimization_results.txt
 timeseries_results.csv
 *.ilp
+*.lp
 
 # Python
 __pycache__/

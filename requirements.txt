@@ -1,3 +1,2 @@
 numpy
-# Gurobi Python API is installed with the Gurobi solver, not via pip:
-#   python -c "import gurobipy; print(gurobipy.gurobi.version())"
+pyscipopt>=5.0.0

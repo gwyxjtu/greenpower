@@ -25,6 +25,11 @@ lambda_PV = 300.0     # PV panel unit price (万元/MW)
 lambda_ST = 80.0      # Energy storage unit price (万元/MWh)
 lambda_GD = 12.0      # Grid transformer unit price (万元/MW)
 
+# Engineering capacity caps (keep the MILP bounded for the open-source solver)
+X_WT_MAX = 500.0      # MW
+X_ST_MAX = 2000.0     # MWh
+X_GD_MAX = 200.0      # MW；--x-gd 0 时的决策上界
+
 # ============================================================
 # 3. Electricity Price Parameters
 # ------------------------------------------------------------
