@@ -6,6 +6,7 @@ Green-power direct-connection microgrid capacity planning (SCIP MILP).
 """
 import argparse
 import csv
+import json
 import os
 import time
 
@@ -54,6 +55,11 @@ def apply_runtime_overrides(mu_re_yuan=None, r0=False, phi=None, theta=None):
         p.theta = float(theta)
 
 
+def _write_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def _add_vars(model, n, name, vtype="C", lb=0.0, ub=None):
     vars_ = []
     for i in range(n):
@@ -97,6 +103,7 @@ def _configure_scip(model, mip_gap, time_limit):
 def run_optimization(X_GD_bound, output_dir=".", mip_gap=MAIN_MIP_GAP, time_limit=MAIN_TIME_LIMIT):
     os.makedirs(output_dir, exist_ok=True)
     results_path = os.path.join(output_dir, "optimization_results.txt")
+    json_path = os.path.join(output_dir, "optimization_results.json")
     csv_path = os.path.join(output_dir, "timeseries_results.csv")
     lp_path = os.path.join(output_dir, "model.lp")
 
@@ -225,11 +232,13 @@ def run_optimization(X_GD_bound, output_dir=".", mip_gap=MAIN_MIP_GAP, time_limi
     if nsols > 0:
         val = model.getVal
         obj = model.getObjVal()
+        status_label = _status_label(model)
+        gap_str = _gap_str(model)
         with open(results_path, "w", encoding="utf-8") as f:
             f.write("=" * 60 + "\n")
-            f.write(f" Optimization Terminated! Status: {_status_label(model)}\n")
+            f.write(f" Optimization Terminated! Status: {status_label}\n")
             f.write(f" Solver: SCIP (PySCIPOpt {pyscipopt.__version__})\n")
-            f.write(f" MIP gap: {_gap_str(model)}\n")
+            f.write(f" MIP gap: {gap_str}\n")
             f.write(f" Total Annualized Objective: {obj:.2f} 万元/年\n")
             f.write("=" * 60 + "\n")
             f.write(" [Optimal Capacities] \n")
@@ -283,7 +292,46 @@ def run_optimization(X_GD_bound, output_dir=".", mip_gap=MAIN_MIP_GAP, time_limi
             f.write(f" - Available RE (x*Θ): {avail_re_val:.2f} MWh\n")
             f.write(f" - On-grid Export (sum_gd_u): {total_gd_u:.2f} MWh\n")
 
+        payload = {
+            "ok": True,
+            "status": status_label,
+            "solver": f"SCIP (PySCIPOpt {pyscipopt.__version__})",
+            "mip_gap": gap_str,
+            "objective_wan_per_year": float(obj),
+            "capacities": {
+                "x_WT_MW": float(val(x_WT)),
+                "x_PV_MW": float(val(x_PV)),
+                "x_ST_MWh": float(val(x_ST)),
+                "x_GD_MW": float(val(x_GD)),
+            },
+            "cost": {
+                "equipment_investment_wan": float(c_inv),
+                "direct_connection_wan": float(c_conn),
+                "annual_demand_charge_wan": float(c_grid),
+                "annual_energy_tariff_wan": float(c_grid_energy),
+                "annual_grid_charge_total_wan": float(c_grid + c_grid_energy),
+                "annual_market_revenue_wan": float(rev_mkt),
+                "unit_cost_label": unit_cost_label(),
+                "unit_cost_yuan_per_kwh": float(c_ele),
+            },
+            "policy": {
+                "ratio_export": float(ratio_export),
+                "ratio_self": float(ratio_self),
+                "ratio_re_load": float(ratio_re_load),
+                "psi": float(p.psi),
+                "phi": float(p.phi),
+                "theta": float(p.theta),
+            },
+            "energy": {
+                "total_re_mwh": float(total_re),
+                "total_load_mwh": float(total_load_e),
+                "avail_re_mwh": float(avail_re_val),
+                "export_mwh": float(total_gd_u),
+            },
+        }
+        _write_json(json_path, payload)
         print(f"Optimization successful! Results saved to '{results_path}'.")
+        print(f"JSON saved to '{json_path}'.")
         x_st_val = val(x_ST)
         with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
@@ -321,13 +369,37 @@ def run_optimization(X_GD_bound, output_dir=".", mip_gap=MAIN_MIP_GAP, time_limi
         print("Model is Infeasible! Please check the parameters or constraints.")
         model.writeProblem(lp_path)
         print(f"LP written to '{lp_path}'")
+        _write_json(
+            json_path,
+            {
+                "ok": False,
+                "status": "infeasible",
+                "message": "当前参数下模型不可行，需放宽 φ/θ 或增大占地、变压器等。",
+                "lp": os.path.basename(lp_path),
+            },
+        )
     else:
         print(f"Optimization ended with status: {status}")
+        _write_json(
+            json_path,
+            {
+                "ok": False,
+                "status": str(status),
+                "message": f"求解结束但无可行解（status={status}）。",
+                "nsols": int(nsols),
+            },
+        )
 
 
 def _cli(argv=None):
     parser = argparse.ArgumentParser(
         description="Green-power MILP capacity planning (SCIP; params.py defaults, optional overrides).",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="JSON config with section-4 scalars plus x_gd / mu_re_yuan / r0 / mip_gap / time_limit / load_csv / pv_csv / wt_csv",
     )
     parser.add_argument("--x-gd", type=float, default=60.0, help="transformer MW; 0 = free 0–X_GD_MAX")
     parser.add_argument(
@@ -354,31 +426,60 @@ def _cli(argv=None):
     )
     args = parser.parse_args(argv)
 
-    apply_runtime_overrides(mu_re_yuan=args.mu_re, r0=args.r0, phi=args.phi, theta=args.theta)
+    mip_gap = args.mip_gap
+    time_limit = args.time_limit
     xgd = args.x_gd
+    mu_re = args.mu_re
+    r0 = args.r0
+
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["_base_dir"] = os.path.dirname(os.path.abspath(args.config))
+        p.apply_full_overrides(cfg)
+        if cfg.get("x_gd") is not None:
+            xgd = float(cfg["x_gd"])
+        if cfg.get("x_gd_free"):
+            xgd = 0.0
+        if cfg.get("mip_gap") is not None:
+            mip_gap = float(cfg["mip_gap"])
+        if cfg.get("time_limit") is not None:
+            time_limit = float(cfg["time_limit"])
+        if cfg.get("mu_re_yuan") is not None:
+            mu_re = float(cfg["mu_re_yuan"])
+        r0 = bool(cfg.get("r0", r0))
+    else:
+        apply_runtime_overrides(mu_re_yuan=args.mu_re, r0=args.r0, phi=args.phi, theta=args.theta)
+
+    if args.config:
+        if args.phi is not None:
+            p.phi = float(args.phi)
+        if args.theta is not None:
+            p.theta = float(args.theta)
+
     if args.out:
         out = args.out
     else:
         stem = (
             f"x_gd_{int(xgd) if xgd and float(xgd).is_integer() else xgd}" if xgd else "x_gd_free"
         )
-        if args.mu_re == 0.0:
+        if mu_re == 0.0:
             stem += "_mu_zero"
-        elif args.mu_re is not None:
-            stem += f"_mu{args.mu_re:.2f}"
-        if args.r0:
+        elif mu_re is not None:
+            stem += f"_mu{mu_re:.2f}"
+        if r0:
             stem += "_R0"
         out = os.path.join("out", stem)
     print(
-        f"[solve] SCIP  x_GD={'free' if not xgd else xgd}  mu_re={args.mu_re}  "
-        f"R={'0' if args.r0 else f'{p.R:.4f}'}  phi={p.phi} theta={p.theta} "
-        f"gap={args.mip_gap} time={args.time_limit}s -> {out}"
+        f"[solve] SCIP  x_GD={'free' if not xgd else xgd}  mu_re={mu_re}  "
+        f"R={'0' if abs(p.R) < 1e-12 else f'{p.R:.4f}'}  phi={p.phi} theta={p.theta} "
+        f"gap={mip_gap} time={time_limit}s -> {out}"
     )
     run_optimization(
         0 if not xgd else xgd,
         output_dir=out,
-        mip_gap=args.mip_gap,
-        time_limit=args.time_limit,
+        mip_gap=mip_gap,
+        time_limit=time_limit,
     )
 
 

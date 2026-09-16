@@ -1,0 +1,9 @@
+# Fragment to add on 4090-server /home/guo/app/frp/frpc.toml
+# Do not commit the live token. Access: http://<frpserver>:18501
+
+[[proxies]]
+name = "greenpower-web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8501
+remotePort = 18501

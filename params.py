@@ -73,6 +73,11 @@ mu_PV = 0.02595       # 万元/MWh  (= 0.2595 元/kWh)
 mu_WT = 0.02595       # 万元/MWh  (= 0.2595 元/kWh)
 assert mu_PV < mu_EB and mu_WT < mu_EB, "内部转移价 μ^{PV}/μ^{WT} 必须小于购电价 μ^{EB}"
 
+# μ^{ES}: 余电上网电价（峰 / 平 / 谷），万元/MWh
+mu_ES_peak = 0.045    # = 0.45 元/kWh
+mu_ES_flat = 0.035    # = 0.35 元/kWh
+mu_ES_valley = 0.025  # = 0.25 元/kWh
+
 # μ^{TL}: 绿电直连专线单位造价
 # 行业公开口径约 100 万元/km（含线路；升压站另计）
 # 来源：经济观察网等绿电直连成本访谈（2025）
@@ -132,8 +137,12 @@ P_ST_MAX_D = 50.0     # Maximum discharging power P^{ST,D,MAX} (MW)
 # ============================================================
 # Θ: 年等效利用小时数 (h)。合成 α 将按此目标归一：Σ α_t Δ = Θ
 # 来源：宁夏典型年——光伏约 1500h、风电约 2000h（国家能源局“塞上绿电”）
-Theta_PV = 1500.0
-Theta_WT = 1800.0
+# TARGET 供覆盖/标定；导入后 Theta_PV / Theta_WT 会被实际时序覆盖
+Theta_PV_TARGET = 1500.0
+Theta_WT_TARGET = 1800.0
+Theta_PV = Theta_PV_TARGET
+Theta_WT = Theta_WT_TARGET
+normalize_pv = False  # True 时把光伏容量因子缩放到 Theta_PV_TARGET
 
 phi   = 0.6           # φ: 自发自用 / 可用发电量 下限 (15)；政策常用 ≥60%
 psi   = 0.20          # α: 余电上网 / 可用发电量 上限 (17)
@@ -146,6 +155,7 @@ theta = 0.30          # β: 新能源发电量 / 用电量 下限 (16)
 # Load: synthetic diurnal + seasonal profile scaled to design load L.
 # PV:   PVWatts hourly AC (Yinchuan) in data/pvwatts_hourly.csv.
 # Wind: same file's 10 m wind → hub-height shear → calibrated to Theta_WT.
+# JSON overrides may replace any of the three via load_csv / pv_csv / wt_csv.
 
 def _normalize_cf_to_hours(alpha, target_hours, delta):
     """Scale capacity-factor series so Σ α·Δ = target_hours, keep α ∈ [0, 1]."""
@@ -253,11 +263,13 @@ def generate_synthetic_data(T):
 
     # PV capacity factor: AC output per 1 kW DC → MW/MW (0–1)
     alpha_PV_t = np.clip(ac_output / 1000.0, 0.0, 1.0)
+    if normalize_pv:
+        alpha_PV_t = _normalize_cf_to_hours(alpha_PV_t, Theta_PV_TARGET, delta)
 
     # Wind: 10 m AGL (PVWatts) is far too weak for utility turbines.
     # Extrapolate to 100 m hub height, then calibrate intensity to Θ_WT (宁夏典型 ~1800 h).
     v_hub = _hub_height_wind(wind_speed_10m, h_ref=10.0, h_hub=100.0, shear_exp=0.14)
-    alpha_WT_t, wind_scale, theta_wt_raw = _calibrate_wind_cf(v_hub, Theta_WT, delta)
+    alpha_WT_t, wind_scale, theta_wt_raw = _calibrate_wind_cf(v_hub, Theta_WT_TARGET, delta)
     alpha_WT_t = np.clip(alpha_WT_t, 0.0, 1.0)
 
     theta_pv_actual = float(np.sum(alpha_PV_t * delta))
@@ -269,12 +281,12 @@ def generate_synthetic_data(T):
     mu_EB_t = np.full(T, mu_EB)
 
     # Market / on-grid sell price μ^{ES}: peak / flat / valley
-    mu_ES_t = np.full(T, 0.035)  # flat
+    mu_ES_t = np.full(T, mu_ES_flat)
     peak_hours = (hour_of_day >= 8) & (hour_of_day < 12) | \
                  (hour_of_day >= 17) & (hour_of_day < 21)
     valley_hours = (hour_of_day >= 23) | (hour_of_day < 7)
-    mu_ES_t[peak_hours] = 0.045
-    mu_ES_t[valley_hours] = 0.025
+    mu_ES_t[peak_hours] = mu_ES_peak
+    mu_ES_t[valley_hours] = mu_ES_valley
 
     return (
         load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t,
@@ -282,24 +294,173 @@ def generate_synthetic_data(T):
     )
 
 
-# Generate and export
-(
-    load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t,
-    _theta_pv, _theta_wt, _v_hub_mean, _wind_scale,
-) = generate_synthetic_data(T)
-# PV Θ from measured AC; WT Θ from calibrated series (≈ target Theta_WT)
-Theta_PV = _theta_pv
-Theta_WT = _theta_wt
-mu_MKT_t = mu_ES_t  # backward-compatible alias
-mu_EO_t = np.full(T, mu_EO)
-mu_EL_t = np.full(T, mu_EL)
-mu_EG_t = np.full(T, mu_EG)
+def _resolve_series_file(cfg, key):
+    raw = cfg.get(key)
+    if not raw:
+        return None
+    if os.path.isabs(raw):
+        return raw
+    base = cfg.get("_base_dir") or "."
+    return os.path.join(base, raw)
 
-print(
-    f"[params] Θ_PV={Theta_PV:.1f} h (PVWatts AC), "
-    f"Θ_WT={Theta_WT:.1f} h (hub-height shear + scale×{_wind_scale:.2f}, "
-    f"v_hub_mean_raw={_v_hub_mean:.2f} m/s → {_v_hub_mean*_wind_scale:.2f} m/s)"
+
+def _series_overrides_from_cfg(cfg):
+    from timeseries_io import parse_series
+
+    overrides = {"scale_load_to_L": bool(cfg.get("scale_load_to_L", False))}
+    mapping = (("load_csv", "load", "load_t"), ("pv_csv", "pv", "alpha_PV_t"), ("wt_csv", "wt", "alpha_WT_t"))
+    for key, kind, dest in mapping:
+        path = _resolve_series_file(cfg, key)
+        if not path:
+            continue
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"{kind} CSV not found: {path}")
+        overrides[dest] = parse_series(path, kind)
+    return overrides
+
+
+def rebuild_time_series(series_overrides=None):
+    """Regenerate 8760 h load / CF / price series from current scalar params."""
+    global load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t
+    global Theta_PV, Theta_WT, mu_MKT_t, mu_EO_t, mu_EL_t, mu_EG_t
+    global _theta_pv, _theta_wt, _v_hub_mean, _wind_scale
+    global mu_ELE, mu_BUY, nu
+
+    (
+        load_t, alpha_WT_t, alpha_PV_t, mu_ES_t, mu_PV_t, mu_WT_t, mu_EB_t,
+        _theta_pv, _theta_wt, _v_hub_mean, _wind_scale,
+    ) = generate_synthetic_data(T)
+    src = {"load": "synthetic", "pv": "pvwatts", "wt": "calibrated"}
+    ov = series_overrides or {}
+    if ov.get("load_t") is not None:
+        load_t = np.asarray(ov["load_t"], dtype=float)
+        peak = float(np.max(load_t)) if load_t.size else 0.0
+        if ov.get("scale_load_to_L") and peak > 0:
+            load_t = load_t * (L / peak)
+            src["load"] = "csv,scaled_to_L"
+        else:
+            src["load"] = "csv"
+    if ov.get("alpha_PV_t") is not None:
+        alpha_PV_t = np.clip(np.asarray(ov["alpha_PV_t"], dtype=float), 0.0, 1.0)
+        if normalize_pv:
+            alpha_PV_t = _normalize_cf_to_hours(alpha_PV_t, Theta_PV_TARGET, delta)
+            src["pv"] = "csv,scaled_hours"
+        else:
+            src["pv"] = "csv"
+    if ov.get("alpha_WT_t") is not None:
+        alpha_WT_t = np.clip(np.asarray(ov["alpha_WT_t"], dtype=float), 0.0, 1.0)
+        src["wt"] = "csv"
+        _wind_scale = 1.0
+    Theta_PV = float(np.sum(alpha_PV_t * delta))
+    Theta_WT = float(np.sum(alpha_WT_t * delta))
+    _theta_pv = Theta_PV
+    _theta_wt = Theta_WT
+    mu_MKT_t = mu_ES_t
+    mu_EO_t = np.full(T, mu_EO)
+    mu_EL_t = np.full(T, mu_EL)
+    mu_EG_t = np.full(T, mu_EG)
+    mu_ELE = mu_ED
+    mu_BUY = mu_EB
+    nu = mu_TL
+    print(
+        f"[params] load={src['load']} pv={src['pv']} wt={src['wt']}; "
+        f"Θ_PV={Theta_PV:.1f} h"
+        f"{', scaled to target' if normalize_pv and src['pv'] != 'csv' else ''}, "
+        f"Θ_WT={Theta_WT:.1f} h"
+        + (
+            f" (hub-height shear + scale×{_wind_scale:.2f}, "
+            f"v_hub_mean_raw={_v_hub_mean:.2f} m/s → {_v_hub_mean*_wind_scale:.2f} m/s)"
+            if src["wt"] == "calibrated"
+            else ""
+        )
+    )
+
+
+_SCALAR_KEYS = (
+    "L",
+    "lambda_WT",
+    "lambda_PV",
+    "lambda_ST",
+    "lambda_GD",
+    "mu_TL",
+    "D",
+    "a_PV",
+    "S_PV_MAX",
+    "X_WT_MAX",
+    "X_ST_MAX",
+    "X_GD_MAX",
+    "mu_DC",
+    "mu_ED",
+    "mu_EO",
+    "mu_EL",
+    "mu_EG",
+    "mu_EB",
+    "mu_PV",
+    "mu_WT",
+    "mu_ES_peak",
+    "mu_ES_flat",
+    "mu_ES_valley",
+    "L_bar",
+    "M",
+    "discount_rate",
+    "project_life",
+    "phi",
+    "psi",
+    "theta",
+    "eta_ch",
+    "eta_dis",
+    "E_init",
+    "P_ST_MAX_C",
+    "P_ST_MAX_D",
+    "E_eps",
 )
+
+
+def apply_full_overrides(cfg):
+    """
+    Apply a JSON config dict, then rebuild 8760 h series.
+    Price fields are model-internal (万元/MWh or 万元/MW/月).
+    Optional mu_re_yuan (元/kWh) overrides μ_PV and μ_WT after other scalars.
+    Optional load_csv / pv_csv / wt_csv replace the corresponding 8760 h series.
+    scale_load_to_L rescales an uploaded load curve so its peak equals L.
+    """
+    global R, CRF, normalize_pv, Theta_PV_TARGET, Theta_WT_TARGET
+    if not cfg:
+        return
+    g = globals()
+    for key in _SCALAR_KEYS:
+        if key in cfg and cfg[key] is not None:
+            g[key] = float(cfg[key])
+    if cfg.get("Theta_PV_TARGET") is not None:
+        Theta_PV_TARGET = float(cfg["Theta_PV_TARGET"])
+    elif cfg.get("Theta_PV") is not None:
+        Theta_PV_TARGET = float(cfg["Theta_PV"])
+    if cfg.get("Theta_WT_TARGET") is not None:
+        Theta_WT_TARGET = float(cfg["Theta_WT_TARGET"])
+    elif cfg.get("Theta_WT") is not None:
+        Theta_WT_TARGET = float(cfg["Theta_WT"])
+    if "normalize_pv" in cfg:
+        normalize_pv = bool(cfg["normalize_pv"])
+    if cfg.get("mu_re_yuan") is not None:
+        v = float(cfg["mu_re_yuan"]) * 0.1
+        g["mu_PV"] = v
+        g["mu_WT"] = v
+    if cfg.get("r0") or (cfg.get("R") is not None and abs(float(cfg["R"])) < 1e-12):
+        R = 0.0
+        CRF = 0.0
+    elif cfg.get("R") is not None:
+        R = float(cfg["R"])
+        CRF = R
+    else:
+        CRF = calculate_crf(discount_rate, int(project_life))
+        R = CRF
+    if not (mu_PV < mu_EB and mu_WT < mu_EB):
+        raise AssertionError("内部转移价 μ^{PV}/μ^{WT} 必须小于购电价 μ^{EB}")
+    rebuild_time_series(_series_overrides_from_cfg(cfg))
+
+
+# Generate and export
+rebuild_time_series()
 
 # MILP relaxation of Word's strict inequality 0 < E_{t+1}
 E_eps = 1e-4

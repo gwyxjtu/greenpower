@@ -13,6 +13,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.streamlit/secrets.toml
 
 # 系统 / IDE
 .DS_Store

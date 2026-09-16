@@ -1,0 +1,16 @@
+[Unit]
+Description=Greenpower Streamlit capacity-planning UI
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/guo/gurobi_code/greenpower
+Environment=PATH=/home/guo/anaconda3/bin:/usr/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=LD_LIBRARY_PATH=/home/guo/anaconda3/lib
+ExecStart=/home/guo/anaconda3/bin/python -m streamlit run app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
