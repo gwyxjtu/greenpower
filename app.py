@@ -99,23 +99,10 @@ def _on_invest_mode_change():
 
 
 def _preset_min_case():
-    st.session_state.x_gd_mode = MODE_MANUAL
-    st.session_state.x_gd = 60.0
-    st.session_state.mu_PV_yuan = 0.0
-    st.session_state.mu_WT_yuan = 0.0
-    st.session_state.invest_mode = INVEST_LOAD
-    st.session_state.crf_r = 0.1168
-    st.session_state.discount_rate_pct = 8.0
-    st.session_state.phi = 60.0
-    st.session_state.theta = 30.0
-    st.session_state.psi = 20.0
-    st.session_state.mip_gap = 0.01
-    st.session_state.time_limit = 600.0
-    st.session_state.scale_load_to_L = False
-    st.session_state.load_src = SRC_DEFAULT
-    st.session_state.pv_src = SRC_DEFAULT
-    st.session_state.wt_src = SRC_DEFAULT
-    st.session_state.upload_nonce = int(st.session_state.get("upload_nonce", 0)) + 1
+    nonce = int(st.session_state.get("upload_nonce", 0)) + 1
+    for key, value in DEFAULTS.items():
+        st.session_state[key] = value
+    st.session_state.upload_nonce = nonce
 
 
 def _to_internal(yuan):
@@ -220,6 +207,7 @@ def load_preview_series():
         "Theta_PV": float(p.Theta_PV),
         "Theta_WT": float(p.Theta_WT),
         "T": int(p.T),
+        "L": float(p.L),
     }
 
 
@@ -449,6 +437,12 @@ def _compose_preview(default_series, load_arr, pv_arr, wt_arr):
             sources["负荷"] = "上传后按设计峰值调整"
         else:
             sources["负荷"] = "上传"
+    else:
+        l_ref = float(default_series.get("L") or 50.0)
+        l_now = float(st.session_state.L)
+        if l_ref > 1e-9:
+            load_t = load_t * (l_now / l_ref)
+        sources["负荷"] = f"宁夏默认（峰值约 {float(load_t.max()):.1f} MW）"
     if pv_arr is not None:
         alpha_pv = np.clip(np.asarray(pv_arr, dtype=float), 0.0, 1.0)
         sources["光伏"] = "上传"
@@ -588,7 +582,8 @@ def _status_text(status, gap):
     )
 
 
-def render_results(payload, csv_path, txt_path, lp_path):
+def render_results(payload, csv_path, txt_path, lp_path, key_prefix=""):
+    pfx = str(key_prefix or "job")
     if not payload:
         st.error("没有找到结果文件。")
         return
@@ -600,7 +595,7 @@ def render_results(payload, csv_path, txt_path, lp_path):
                 "下载不可行模型文件",
                 data=Path(lp_path).read_bytes(),
                 file_name="model.lp",
-                key="dl_lp",
+                key=f"{pfx}_dl_lp",
             )
         return
 
@@ -686,16 +681,16 @@ def render_results(payload, csv_path, txt_path, lp_path):
 
         left, right = st.columns([0.22, 0.78])
         with left:
-            ov_vis = _trace_toggles(["负荷", "风电", "光伏", "购电", "上网"], "ov")
+            ov_vis = _trace_toggles(["负荷", "风电", "光伏", "购电", "上网"], f"{pfx}_ov")
         with right:
             st.plotly_chart(_plot_overview(df, ov_vis), use_container_width=True)
 
-        day = st.slider("查看全年中的第几天", min_value=1, max_value=365, key="result_day")
+        day = st.slider("查看全年中的第几天", min_value=1, max_value=365, key=f"{pfx}_result_day")
         dleft, dright = st.columns([0.22, 0.78])
         with dleft:
             day_vis = _trace_toggles(
                 ["负荷", "风电", "光伏", "充电", "放电", "购电", "上网", "荷电状态"],
-                "day",
+                f"{pfx}_day",
             )
         with dright:
             st.plotly_chart(_plot_day(df, day, day_vis), use_container_width=True)
@@ -706,14 +701,14 @@ def render_results(payload, csv_path, txt_path, lp_path):
             "下载文字结果",
             data=Path(txt_path).read_bytes(),
             file_name="optimization_results.txt",
-            key="dl_txt",
+            key=f"{pfx}_dl_txt",
         )
     if csv_path:
         dl2.download_button(
             "下载逐时数据",
             data=Path(csv_path).read_bytes(),
             file_name="timeseries_results.csv",
-            key="dl_csv",
+            key=f"{pfx}_dl_csv",
         )
     json_path = Path(txt_path).with_name("optimization_results.json") if txt_path else None
     if json_path and json_path.exists():
@@ -721,13 +716,107 @@ def render_results(payload, csv_path, txt_path, lp_path):
             "下载结构化结果",
             data=json_path.read_bytes(),
             file_name="optimization_results.json",
-            key="dl_json",
+            key=f"{pfx}_dl_json",
         )
 
 
 def _ensure_session_id():
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
+
+
+def _render_job_body(job_id):
+    rec = svc.get_job(job_id)
+    if rec is None:
+        st.warning("未找到所选计算结果。")
+        return None
+    status = rec.get("status")
+    out_dir = rec.get("dir")
+    log = svc.read_log(out_dir) if out_dir else ""
+    qst = svc.queue_status()
+    poll_key = f"_poll_{job_id}"
+
+    if status == "queued":
+        st.session_state[poll_key] = True
+        st.info(
+            f"该任务正在排队。当前计算中 {qst['running']} 个，排队 {qst['waiting']} 个"
+            f"（最多同时 {qst['max_running']} 个）。"
+        )
+        if log:
+            with st.expander("求解日志", expanded=True):
+                st.code(log[-12000:], language="text")
+        return "pending"
+
+    if status == "running":
+        st.session_state[poll_key] = True
+        st.info("该任务正在计算，通常需要数分钟。完成后会自动显示结果。")
+        with st.expander("求解日志", expanded=True):
+            st.code(log[-12000:] if log else "正在启动求解器…", language="text")
+        return "pending"
+
+    if st.session_state.pop(poll_key, None):
+        st.rerun()
+
+    if log:
+        with st.expander("求解日志", expanded=False):
+            st.code(log[-12000:], language="text")
+
+    packed = svc.load_result(out_dir) if out_dir else {}
+    has_files = packed.get("json") or packed.get("lp_path") or packed.get("txt_path")
+    if has_files:
+        render_results(
+            packed.get("json"),
+            packed.get("csv_path"),
+            packed.get("txt_path"),
+            packed.get("lp_path"),
+            key_prefix=job_id,
+        )
+        return status
+    if status in ("failed", "infeasible"):
+        st.error(rec.get("summary") or "求解失败。")
+    else:
+        st.error("没有找到结果文件。")
+    return status
+
+
+@st.fragment(run_every=2.0)
+def _render_live_job():
+    job_id = st.session_state.get("selected_job_id")
+    if job_id:
+        _render_job_body(job_id)
+
+
+def _render_history_panel():
+    flash = st.session_state.pop("job_flash", None)
+    if flash:
+        st.success(flash)
+
+    items = svc.list_history()
+    if not items:
+        st.caption("尚未运行。可先点「输入宁夏省案例参数」，再点「计算最优容量配置方案」。")
+        return
+
+    ids = [rec["id"] for rec in items if rec.get("id")]
+    labels = {rec["id"]: svc.job_label(rec) for rec in items if rec.get("id")}
+    current = st.session_state.get("selected_job_id")
+    if current not in ids:
+        st.session_state.selected_job_id = ids[0]
+
+    st.selectbox(
+        "历史计算结果",
+        ids,
+        key="selected_job_id",
+        format_func=lambda job_id: labels.get(job_id, job_id),
+        help="保留最近 5 次已完成结果；正在排队或计算的任务也会出现在列表中。",
+    )
+    st.caption("可在此切换查看历史方案。正在排队或计算的任务也会列入，完成后自动显示结果。")
+
+    job_id = st.session_state.selected_job_id
+    rec = next((x for x in items if x.get("id") == job_id), None)
+    if rec and rec.get("status") in ("queued", "running"):
+        _render_live_job()
+    else:
+        _render_job_body(job_id)
 
 
 def _render_login():
@@ -775,6 +864,7 @@ def main():
         "按全年 8760 小时运行模拟。默认场景锚定宁夏 110 千伏两部制工商业。"
     )
     st.button("输入宁夏省案例参数", on_click=_preset_min_case)
+    st.caption("将负荷、造价、电价、储能、政策比例、出力曲线来源等全部参数恢复为宁夏案例默认值。")
 
     st.header("参数配置")
 
@@ -916,58 +1006,16 @@ def main():
             for msg in errors:
                 st.error(msg)
         else:
-            log_box = st.empty()
-            status_box = st.status("正在排队或计算，通常需要数分钟…", expanded=True)
-
-            def _on_wait(pos, running, pending):
-                if pos > 0:
-                    status_box.update(
-                        label=f"排队中：前面还有 {pos} 个任务，当前计算中 {running} 个。",
-                        state="running",
-                    )
-                else:
-                    status_box.update(
-                        label=f"排队中：已有 {running} 个任务在计算（最多 3 个），请稍候。",
-                        state="running",
-                    )
-
-            def _on_log(text):
-                status_box.update(label="正在计算最优容量配置方案…", state="running")
-                log_box.code(text[-8000:], language="text")
-
             try:
-                job_id, out_dir, rc, log = svc.run_job(
-                    cfg,
-                    log_callback=_on_log,
-                    series_bytes=series_bytes,
-                    wait_callback=_on_wait,
-                )
+                job_id, _out_dir = svc.start_job(cfg, series_bytes=series_bytes)
+                st.session_state.selected_job_id = job_id
                 st.session_state.last_job_id = job_id
-                st.session_state.last_out_dir = str(out_dir)
-                st.session_state.last_log = log
-                st.session_state.last_rc = rc
-                if rc == 0:
-                    status_box.update(label="求解进程已结束", state="complete")
-                else:
-                    status_box.update(label=f"求解进程异常退出（代码 {rc}）", state="error")
+                st.session_state.job_flash = "已开始计算。可在下方历史记录中查看进度或切换其他结果。"
+                st.rerun()
             except Exception as exc:
-                status_box.update(label=str(exc), state="error")
-                st.warning(str(exc))
+                st.error(str(exc))
 
-    if st.session_state.get("last_log"):
-        with st.expander("求解日志", expanded=False):
-            st.code(st.session_state.last_log[-12000:], language="text")
-
-    if st.session_state.get("last_out_dir"):
-        packed = svc.load_result(st.session_state.last_out_dir)
-        render_results(
-            packed["json"],
-            packed["csv_path"],
-            packed["txt_path"],
-            packed["lp_path"],
-        )
-    else:
-        st.caption("尚未运行。可先点「输入宁夏省案例参数」，再点「计算最优容量配置方案」。")
+    _render_history_panel()
 
 
 if __name__ == "__main__":
